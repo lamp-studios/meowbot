@@ -1,0 +1,5 @@
+# keep line endings right no matter which OS you commit from
+*.sh  text eol=lf
+*.py  text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
