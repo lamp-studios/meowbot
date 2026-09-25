@@ -82,6 +82,8 @@ if [[ -z "$a" || "$a" =~ ^[yY] ]]; then
 Description=MeowBot discord bot
 Wants=network-online.target ollama.service
 After=network-online.target ollama.service
+# don't give up if it crash-loops (e.g. discord outage), just keep retrying
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -91,8 +93,6 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=${UV_BIN} run --frozen python ${PROJECT_DIR}/${ENTRY}
 Restart=always
 RestartSec=10
-# don't give up if it crash-loops (e.g. discord outage), just keep retrying
-StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
