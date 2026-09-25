@@ -26,7 +26,8 @@ restart_bot() {
 log() { echo "[updater] $*"; }
 
 # don't let two updates run at the same time
-exec 9>"/tmp/${SERVICE_NAME}-update.lock"
+# (lock lives in .git, not /tmp, since debian blocks root from opening another user's file in /tmp)
+exec 9>"$PROJECT_DIR/.git/${SERVICE_NAME}-update.lock"
 flock -n 9 || { log "another update is already running, skipping"; exit 0; }
 
 UPSTREAM="$(as_owner git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
