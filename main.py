@@ -395,7 +395,7 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
 
     if provider == "Pollinations (Free, bad)":
         async with aiohttp.ClientSession() as session:
-                url = f"https://image.pollinations.ai/prompt/{prompt}?width=512&height=512"
+                url = f"https://image.pollinations.ai/prompt/{prompt.replace(" ", "%20")}?width=512&height=512"
                 async with session.get(url) as resp:
                     if resp.status != 200:
                         return await ctx.respond(f"The image could not be sent here, instead, here's the image url: {url}")
