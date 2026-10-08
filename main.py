@@ -20,6 +20,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 dotenv.load_dotenv(os.path.join(BASE_DIR, ".env"))
 token = str(os.getenv("bot_token_dontleak")) # pls dont
 wavelink_password = str(os.getenv("wavelink_password"))
+CF_ACCOUNT_ID = str(os.getenv("CF_ACCOUNT_ID"))
+HEADERS = os.getenv("headers")
+
+currently_limited = []
 
 bot = discord.Bot(
     default_command_integration_types={
@@ -385,6 +389,7 @@ async def up(ctx: discord.ApplicationContext):
 @discord.option("provider", description="The provider to use", choices=["Pollinations (Free, bad)", "OpenRouter (Paid)", "AI Horde (Free, Slow)", "Cloudflare Workers AI (Free but limited)"])
 async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
     import random
+    await ctx.defer()
     emojis = await ctx.bot.fetch_emojis()
     if emojis:
         loading_emoji = "<a:loading2:1545845203519283311>"  # app emoji
@@ -400,6 +405,22 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                     if resp.status != 200:
                         return await ctx.respond(f"The image could not be sent here, instead, here's the image url: {url}")
                     data = await resp.read()
+
+    if provider == "Cloudflare Workers AI (Free but limited)":
+        form = aiohttp.FormData()
+        form.add_field("prompt", prompt)
+        form.add_field("width", "512")
+        form.add_field("height", "512")
+
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-2-klein-4b"
+        headers = HEADERS
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=form) as resp:
+                result = await resp.json()
+                if resp.status != 200 or not result.get("success"):
+                    return await msg.edit(content=f"Cloudflare said nah: {result.get('errors')}")
+                data = base64.b64decode(result["result"]["image"])
 
     file = discord.File(io.BytesIO(data), filename=f"{random.randint(100,100000000000)}_generated.png")
     await msg.edit(content="The image has finished generating!", file=file)
