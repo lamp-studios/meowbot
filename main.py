@@ -21,7 +21,7 @@ dotenv.load_dotenv(os.path.join(BASE_DIR, ".env"))
 token = str(os.getenv("bot_token_dontleak")) # pls dont
 wavelink_password = str(os.getenv("wavelink_password"))
 workers_ai_key = str(os.getenv("workers_ai_key"))
-cf_account_id = os.getenv()
+cf_account_id = os.getenv("CF_ACCOUNT_ID")
 HEADERS = os.getenv("headers")
 
 currently_limited = []
