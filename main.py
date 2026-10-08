@@ -20,7 +20,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 dotenv.load_dotenv(os.path.join(BASE_DIR, ".env"))
 token = str(os.getenv("bot_token_dontleak")) # pls dont
 wavelink_password = str(os.getenv("wavelink_password"))
-CF_ACCOUNT_ID = str(os.getenv("CF_ACCOUNT_ID"))
+workers_ai_key = str(os.getenv("workers_ai_key"))
+cf_account_id = os.getenv()
 HEADERS = os.getenv("headers")
 
 currently_limited = []
@@ -412,8 +413,8 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
         form.add_field("width", "512")
         form.add_field("height", "512")
 
-        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-2-klein-4b"
-        headers = HEADERS
+        url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/@cf/black-forest-labs/flux-2-klein-4b"
+        headers = {"Authorization": f"Bearer {workers_ai_key}"}
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, headers=headers, data=form) as resp:
