@@ -5,7 +5,7 @@ import cv2
 import base64
 import wavelink
 import asyncio
-import io
+import io, aiohttp
 import re
 import typing
 import numpy as np
@@ -223,6 +223,8 @@ def trim(history):
         history[:] = [history[0]] + history[-MAX_TURNS:]
 
 
+generatecommand = bot.create_group("generate", "Generative AI stuff")
+
 @bot.event
 async def on_ready():
     print(f"{bot.user}, {bot.user.id} is running")
@@ -378,6 +380,31 @@ async def up(ctx: discord.ApplicationContext):
         bot.reload_extension(ext)
     await ctx.respond("synced + reloaded", ephemeral=True)
 
+@generatecommand.command()
+@discord.option("prompt", description="The prompt for the image")
+@discord.option("provider", description="The provider to use", choices=["Pollinations (Free, bad)", "OpenRouter (Paid)", "AI Horde (Free, Slow)", "Cloudflare Workers AI (Free but limited)"])
+async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
+    import random
+    emojis = await ctx.bot.fetch_emojis()
+    if emojis:
+        loading_emoji = "<a:loading2:1545845203519283311>"  # app emoji
+    else:
+        loading_emoji = "<a:loading2:1545851854821396500>"  # guild emoji
+
+    msg = await ctx.respond(f"{loading_emoji}\nThe image is being generated, please wait...")
+
+    if provider == "Pollinations (Free, bad)":
+        async with aiohttp.ClientSession() as session:
+                url = f"https://image.pollinations.ai/prompt/{prompt}?width=512&height=512"
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return await ctx.respond(f"The image could not be sent here, instead, here's the image url: {url}")
+                    data = await resp.read()
+
+    file = discord.File(io.BytesIO(data), filename=f"{random.randint(100,100000000000)}_generated.png")
+    await msg.edit(content="The image has finished generating!", file=file)
+
+
 @bot.slash_command(name="ai_tts_stop", description="Stop reading replies out loud and leave the VC.")
 async def ai_tts_stop(ctx: discord.ApplicationContext):
     await ctx.defer()
@@ -397,7 +424,6 @@ async def ai_tts_stop(ctx: discord.ApplicationContext):
         await vc.disconnect()
 
     await ctx.respond("TTS off, left the VC.")
-
 
 @bot.slash_command(name="debugging") # debugging moment
 async def debugging(ctx: discord.ApplicationContext):
