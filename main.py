@@ -408,6 +408,8 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                     data = await resp.read()
 
     if provider == "Cloudflare Workers AI (Free but limited)":
+        if ctx.author.id in currently_limited:
+            return await msg.edit(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!")
         form = aiohttp.FormData()
         form.add_field("prompt", prompt)
         form.add_field("width", "512")
@@ -462,7 +464,7 @@ async def debugging(ctx: discord.ApplicationContext):
         lines.append(f"guild {gid}: {q.qsize()} lines queued")
 
     await ctx.respond("Debugging:\n" + "\n".join(lines), ephemeral=True)
-
+    await ctx.send(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!")
 
 """@bot.slash_command(name="play_song", description="Play a song from YouTube.")
 async def play(ctx: discord.ApplicationContext, search: str):
