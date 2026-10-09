@@ -13,9 +13,12 @@ from kokoro_onnx import Kokoro
 import requests
 from discord.ui import DesignerView, Container, TextDisplay, Separator, Section, Button
 from discord.ext import commands
+import datetime
 
 # resolve files relative to this script so it works no matter where it's launched from (systemd, cron, etc)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USAGE_FILE = "gen_usage.json"
+
 
 dotenv.load_dotenv(os.path.join(BASE_DIR, ".env"))
 token = str(os.getenv("bot_token_dontleak")) # pls dont
@@ -24,7 +27,7 @@ workers_ai_key = str(os.getenv("workers_ai_key"))
 cf_account_id = os.getenv("CF_ACCOUNT_ID")
 HEADERS = os.getenv("headers")
 
-currently_limited = []
+currently_limited = {}
 
 bot = discord.Bot(
     default_command_integration_types={
@@ -118,6 +121,18 @@ if sys.platform.startswith("linux") and not discord.opus.is_loaded():
 tts_enabled = set()   # where /ai_tts is ran (aka enabled)
 tts_queues = {}       # guild_id -> asyncio.Queue of strings waiting to be spoken
 tts_workers = {}      # guild_id -> the asyncio.Task draining that queue
+
+def load_usage():
+    if not os.path.exists(USAGE_FILE):
+        return {}
+    with open(USAGE_FILE) as f:
+        return json.load(f)
+
+def save_usage(usage):
+    tmp = USAGE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(usage, f, indent=2)
+    os.replace(tmp, USAGE_FILE)
 
 
 def clean_for_tts(text: str) -> str:
@@ -408,8 +423,19 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                     data = await resp.read()
 
     if provider == "Cloudflare Workers AI (Free but limited)":
-        if ctx.author.id in currently_limited:
-            return await msg.edit(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!")
+        today = datetime.date.today().isoformat()
+        uid = str(ctx.author.id)
+
+        usage = load_usage()
+        user = usage.get(uid, {"day": today, "count": 0, "bonus": 0})
+
+        if user["day"] != today:
+            user["day"] = today
+            user["count"] = 0
+
+        if ctx.author.id != 1056952213056004118:
+            if user["count"] >= 5 + user["bonus"]:
+                return await msg.edit(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!")        
         form = aiohttp.FormData()
         form.add_field("prompt", prompt)
         form.add_field("width", "512")
@@ -424,9 +450,17 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                 if resp.status != 200 or not result.get("success"):
                     return await msg.edit(content=f"Cloudflare said nah: {result.get('errors')}")
                 data = base64.b64decode(result["result"]["image"])
-
+        usage = load_usage()
+        user = usage.get(uid, {"day": today, "count": 0, "bonus": 0})
+        if user["day"] != today:
+            user["day"] = today
+            user["count"] = 0
+        user["count"] += 1
+        usage[uid] = user
+        save_usage(usage)
     file = discord.File(io.BytesIO(data), filename=f"{random.randint(100,100000000000)}_generated.png")
     await msg.edit(content="The image has finished generating!", file=file)
+
 
 
 @bot.slash_command(name="ai_tts_stop", description="Stop reading replies out loud and leave the VC.")
@@ -464,7 +498,7 @@ async def debugging(ctx: discord.ApplicationContext):
         lines.append(f"guild {gid}: {q.qsize()} lines queued")
 
     await ctx.respond("Debugging:\n" + "\n".join(lines), ephemeral=True)
-    await ctx.send(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!")
+    await ctx.send(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each 1€ is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!\n")
 
 """@bot.slash_command(name="play_song", description="Play a song from YouTube.")
 async def play(ctx: discord.ApplicationContext, search: str):
