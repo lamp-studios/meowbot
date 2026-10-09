@@ -1,3 +1,4 @@
+import time
 import dotenv, os, sys, discord
 import ollama
 import json
@@ -18,6 +19,7 @@ import datetime
 # resolve files relative to this script so it works no matter where it's launched from (systemd, cron, etc)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USAGE_FILE = "gen_usage.json"
+DONATOR_FILE = "donators.json"
 
 
 dotenv.load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -36,7 +38,7 @@ bot = discord.Bot(
     },
     owner_id=1056952213056004118,
     intents=discord.Intents.all(),
-    
+
 )
 
 def soggy_cat_api_tool():
@@ -133,6 +135,18 @@ def save_usage(usage):
     with open(tmp, "w") as f:
         json.dump(usage, f, indent=2)
     os.replace(tmp, USAGE_FILE)
+
+def load_donator():
+    if not os.path.exists(DONATOR_FILE):
+        return {}
+    with open(DONATOR_FILE) as f:
+        return json.load(f)
+
+def save_donator(donator):
+    tmp = DONATOR_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(donator, f, indent=2)
+    os.replace(tmp, DONATOR_FILE)
 
 
 def clean_for_tts(text: str) -> str:
@@ -402,7 +416,7 @@ async def up(ctx: discord.ApplicationContext):
 
 @generatecommand.command()
 @discord.option("prompt", description="The prompt for the image")
-@discord.option("provider", description="The provider to use", choices=["Pollinations (Free, bad)", "OpenRouter (Paid)", "AI Horde (Free, Slow)", "Cloudflare Workers AI (Free but limited)"])
+@discord.option("provider", description="The provider to use", choices=["Pollinations (Free, bad)", "OpenRouter (Paid)", "AI Horde (Free, Slow)", "Cloudflare Workers AI (Free but limited)", "Runware (Paid)"])
 async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
     import random
     await ctx.defer()
@@ -421,6 +435,49 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                     if resp.status != 200:
                         return await ctx.respond(f"The image could not be sent here, instead, here's the image url: {url}")
                     data = await resp.read()
+
+    if provider == "OpenRouter (Paid)":
+        WINDOW = 5 * 60 * 60   # 5 hours in seconds
+        MAX_USES = 7
+
+        uid = str(ctx.author.id)
+        donator = load_donator()
+        user = donator.get(uid)
+        now = time.time()
+
+        if not user or user["expires"] < now:
+            return await msg.edit(content="This provider is for donators only! [Donate](https://ko-fi.com/lampyt) to unlock it for 1 month.")
+
+        recent = [t for t in user["uses"] if now - t < WINDOW]
+
+        if len(recent) >= MAX_USES:
+            next_free = int(min(recent) + WINDOW)
+            return await msg.edit(content=f"You've used all {MAX_USES} premium gens! Next one frees up <t:{next_free}:R>.")
+
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "google/gemini-3.1-flash-image",
+            "prompt": prompt,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://openrouter.ai/api/v1/images", headers=headers, json=payload) as resp:
+                result = await resp.json()
+                images = result.get("data") or []
+                if resp.status != 200 or not images:
+                    return await msg.edit(content=f"OpenRouter said nah: {result.get('error', result)}")
+                data = base64.b64decode(images[0]["b64_json"])
+
+        donator = load_donator()
+        user = donator[uid]
+        now = time.time()
+        user["uses"] = [t for t in user["uses"] if now - t < WINDOW] + [now]
+        save_donator(donator)
+
 
     if provider == "Cloudflare Workers AI (Free but limited)":
         today = datetime.date.today().isoformat()
@@ -482,6 +539,22 @@ async def ai_tts_stop(ctx: discord.ApplicationContext):
         await vc.disconnect()
 
     await ctx.respond("TTS off, left the VC.")
+
+ONE_MONTH = 30 * 24 * 60 * 60  # 30 days in seconds
+
+@bot.slash_command(description="Give someone premium access")
+async def adddonator(ctx, member: discord.Member):
+    if ctx.author.id != 1056952213056004118:  # put your discord id here
+        return await ctx.respond("nice try lol", ephemeral=True)
+
+    uid = str(member.id)
+    donator = load_donator()
+    user = donator.get(uid, {"expires": 0, "uses": []})
+    user["expires"] = max(user["expires"], time.time()) + ONE_MONTH
+    donator[uid] = user
+    save_donator(donator)
+
+    await ctx.respond(f"{member.mention} now has premium until <t:{int(user['expires'])}:F>!")
 
 @bot.slash_command(name="debugging") # debugging moment
 async def debugging(ctx: discord.ApplicationContext):
