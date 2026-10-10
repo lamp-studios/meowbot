@@ -191,16 +191,16 @@ def save_donator(donator):
         json.dump(donator, f, indent=2)
     os.replace(tmp, DONATOR_FILE)
 
-def save_logged(user_id):
+def save_logged(logged):
     tmp = LOGGED_FILE + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(user_id, f, indent=2)
+        json.dump(logged, f, indent=2)
     os.replace(tmp, LOGGED_FILE)
 
 
 def load_logged():
     if not os.path.exists(LOGGED_FILE):
-        return {}
+        return []
     with open(LOGGED_FILE) as f:
         return json.load(f)
 
@@ -335,15 +335,19 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 @bot.slash_command(name="opt_in", description="Opt in to getting logged.")
 async def opt_in(ctx: discord.ApplicationContext):
     logged_ppl = load_logged()
-    if ctx.author.id in logged_ppl:
-        await ctx.respond("You are already being logged, use /opt_out to opt out.", ephemeral=True)
+    if str(ctx.author.id) in logged_ppl:
+        return await ctx.respond("You are already being logged, use /opt_out to opt out.", ephemeral=True)
     await ctx.defer()
     class AreYouSure(discord.ui.View):
         @discord.ui.button(label="Yes", style=discord.ButtonStyle.primary, emoji="❗")
         async def button_callback(self, button, interaction):
             if interaction.user.id == ctx.author.id:
                 await ctx.delete()
-                await save_logged(str(ctx.author.id))
+                uid = str(ctx.author.id)
+                logged = load_logged()   # re-read, someone else could've opted in while this sat here
+                if uid not in logged:
+                    logged.append(uid)
+                    save_logged(logged)
                 await interaction.response.send_message("From now on, you are now being logged by the bot, to opt-out, run /opt_out.")
             else:
                 await interaction.response.send_message(f"{interaction.user.mention} blud you didnt send the slash command", ephemeral=True)
