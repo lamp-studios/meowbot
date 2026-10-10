@@ -315,14 +315,13 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 
 @bot.slash_command(name="opt_in", description="Opt in to getting logged.")
 async def opt_in(ctx: discord.ApplicationContext):
+    await ctx.defer()
+    await msg = ctx.respond("**Are you sure you want to get logged from now on?** You can opt-out at any moment with /opt_out if you'd like.\nThis is absolutely not required and can be a risk to your privacy, because it logs the following: **Your messages with the AI AND possibly your outside messages, your images, the commands you ran and your user profile**.\nIf you're sure and want to opt-in anyways, click the 'Yes' button to confirm.", view=AreYouSure())
     class AreYouSure(discord.ui.View):
         @discord.ui.button(label="Yes", style=discord.ButtonStyle.primary, emoji="❗")
         async def button_callback(self, button, interaction):
+            await ctx.message.delete()
             await interaction.response.send_message("From now on, you are now being logged by the bot, to opt-out, run /opt_out.")
-
-    await ctx.defer()
-    await ctx.respond("**Are you sure you want to get logged from now on?** You can opt-out at any moment with /opt_out if you'd like.\nThis is absolutely not required and can be a risk to your privacy, because it logs the following: **Your messages with the AI AND possibly your outside messages, your images, the commands you ran and your user profile**.\nIf you're sure and want to opt-in anyways, click the 'Yes' button to confirm.", view=AreYouSure())
-
 
 @bot.slash_command(name="ask", description="Ask the AI.")
 @discord.option("prompt", type=discord.SlashCommandOptionType.string)
