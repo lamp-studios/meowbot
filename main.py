@@ -498,10 +498,15 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
     text = str(response.message.content)
     print(text)
     text2 = f"Definition for '{prompt}'\n{text}"
-    if text.startswith("Def"):
-        await msg.edit(content=text2)
-    else:
-        await msg.edit(content=f"The generated definition does not start with Definition, here it is anyways:\n{text2}")
+    if not text.startswith("Def"):
+        text2 = f"The generated definition does not start with Definition, here it is anyways:\n{text2}"
+
+    # the prompt gets echoed back as-is, so don't let someone @everyone through it
+    no_pings = discord.AllowedMentions.none()
+    chunks = split_msg(text2)
+    await msg.edit(content=chunks[0], allowed_mentions=no_pings)
+    for extra in chunks[1:]:
+        await ctx.followup.send(extra, allowed_mentions=no_pings)
 
 @bot.slash_command(name="reset", description="Clear your conversation history.")
 async def reset(ctx: discord.ApplicationContext):
