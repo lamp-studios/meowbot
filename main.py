@@ -331,7 +331,7 @@ async def on_ready():
 async def log_every_command(ctx):
     logged_ppl = load_logged()
     if str(ctx.author.id) in logged_ppl:
-        print(f"{ctx.author.id} ({ctx.author.name}) ran /{ctx.command.name} in {ctx.guild.id}, {ctx.guild.name}")
+        print(f"{ctx.author.id} ({ctx.author.name}) ran /{ctx.command} in {ctx.guild.id}, {ctx.guild.name}")
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
