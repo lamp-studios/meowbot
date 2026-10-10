@@ -327,6 +327,12 @@ async def on_ready():
     await start_logger(load_logged())
     #await connect_nodes() # connect to the server
 
+@bot.before_invoke
+async def log_every_command(ctx):
+    logged_ppl = load_logged()
+    if logged_ppl.get(str(ctx.author.id)):
+        print(f"{ctx.author.id} ({ctx.author.name}) ran /{ctx.command.name} in {ctx.guild.id}, {ctx.guild.name}")
+
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
   print(f"Node with ID {payload.session_id} has connected")
