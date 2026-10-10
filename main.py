@@ -401,7 +401,8 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
         user_msg['images'] = [image_data]
         model = 'gemma3:4b' # pain
     else:
-        model = 'llama3.1:8b' # good
+        #model = 'llama3.1:8b' # good, testing qwen for now, uncomment if you want llama
+        model = 'huihui_ai/qwen3-abliterated:8b'
 
     history.append(user_msg)
 
