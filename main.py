@@ -313,9 +313,21 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
   print(f"Node with ID {payload.session_id} has connected")
   print(f"Resumed session: {payload.resumed}")
 
+@bot.slash_command(name="opt_in", description="Opt in to getting logged.")
+async def opt_in(ctx: discord.ApplicationContext):
+    class AreYouSure(discord.ui.View):
+        @discord.ui.button(label="Yes", style=discord.ButtonStyle.primary, emoji="❗")
+        async def button_callback(self, button, interaction):
+            await interaction.response.send_message("From now on, you are now being logged by the bot, to opt-out, run /opt_out.")
+
+    await ctx.defer()
+    await ctx.respond("**Are you sure you want to get logged from now on?** You can opt-out at any moment with /opt_out if you'd like.\nThis is absolutely not required and can be a risk to your privacy, because it logs the following: **Your messages with the AI AND possibly your outside messages, your images, the commands you ran and your user profile**.\nIf you're sure and want to opt-in anyways, click the 'Yes' button to confirm.", view=AreYouSure())
+
+
 @bot.slash_command(name="ask", description="Ask the AI.")
 @discord.option("prompt", type=discord.SlashCommandOptionType.string)
 @discord.option("image", required=False, type=discord.SlashCommandOptionType.attachment) # (apparently you have to put discord.Attachment twice for some reason)
+#@discord.option("ephemeral", type=discord.SlashCommandOptionType.string, required=False, default=False)
 async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attachment = None):
     await ctx.defer()
 
