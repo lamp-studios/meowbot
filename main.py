@@ -334,7 +334,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
 
     history = get_history(ctx.author.id)
 
-    user_msg = {'role': 'user', 'content': str(prompt)}
+    user_msg = {'role': 'user', 'content': f"<@{ctx.author.id}>: {prompt}"}
 
     if image:
         image_bytes = await image.read()
