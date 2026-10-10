@@ -545,7 +545,7 @@ ONE_MONTH = 30 * 24 * 60 * 60  # 30 days in seconds
 
 @bot.slash_command(description="Give someone premium access")
 async def adddonator(ctx, member: discord.Member):
-    if ctx.author.id != 1056952213056004118:  # put your discord id here
+    if ctx.author.id != 1056952213056004118:
         return await ctx.respond("nice try lol", ephemeral=True)
 
     uid = str(member.id)
@@ -556,6 +556,21 @@ async def adddonator(ctx, member: discord.Member):
     save_donator(donator)
 
     await ctx.respond(f"{member.mention} now has premium until <t:{int(user['expires'])}:F>!")
+
+@bot.slash_command(description="Take away someone's premium access")
+async def rmdonator(ctx, member: discord.Member):
+    if ctx.author.id != 1056952213056004118:
+        return await ctx.respond("nice try lol", ephemeral=True)
+
+    uid = str(member.id)
+    donator = load_donator()
+    user = donator.pop(uid, None)
+    if user is None:
+        return await ctx.respond(f"{member.mention} wasn't a donator in the first place lol", ephemeral=True)
+
+    save_donator(donator)
+
+    await ctx.respond(f"{member.mention} is no longer a donator (had premium until <t:{int(user.get('expires', 0))}:F>).")
 
 @bot.slash_command(name="debugging") # debugging moment
 async def debugging(ctx: discord.ApplicationContext):
