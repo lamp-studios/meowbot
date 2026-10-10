@@ -69,7 +69,7 @@ fi
 step "sanity checks"
 [ -f .env ] && ok ".env found" || warn "no .env file, the bot needs bot_token_dontleak=... in it"
 for f in kokoro-v1.0.onnx voices-v1.0.bin; do
-    [ -f "$f" ] && ok "$f found" || warn "missing $f, grab it from the kokoro-onnx github releases"
+    [ -f "$f" ] && ok "$f found" || warn "missing $f, the bot downloads it on first run"
 done
 
 # 6. systemd service for 24/7

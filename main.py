@@ -95,19 +95,59 @@ SYNTH_TIMEOUT = 35        # seconds before we give up on one tts clip
 TTS_QUEUE_MAX = 5         # drop new lines once this many are already waiting
 
 # ---------- kokoro tts config ----------
-KOKORO_MODEL  = os.path.join(BASE_DIR, "kokoro-v1.0.onnx")   # download from the kokoro-onnx releases page
+KOKORO_MODEL  = os.path.join(BASE_DIR, "kokoro-v1.0.onnx")
 KOKORO_VOICES = os.path.join(BASE_DIR, "voices-v1.0.bin")
-TTS_VOICE = "am_michael"  # american male. others: am_fenrir, am_puck, am_eric, am_liam, am_onyx
+KOKORO_RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 TTS_SPEED = 1.01           # 1.0 = normal, 1.2 = noticeably faster
-TTS_LANG  = "en-us"
 TTS_MAX_CHARS = 400
 
+# every voice here already lives inside voices-v1.0.bin, so adding one is just a new line.
+# the key is what shows up in the /ai_tts dropdown -> (kokoro voice id, espeak lang code)
+TTS_VOICES = {
+    "English (Michael)": ("am_michael", "en-us"),  # others: am_fenrir, am_puck, am_eric, am_liam, am_onyx
+    "French (Siwis)":    ("ff_siwis", "fr-fr"),    # only french voice kokoro v1.0 ships
+}
+TTS_DEFAULT_VOICE = "English (Michael)"
+
 # kokoro load
-if not os.path.exists(KOKORO_MODEL) or not os.path.exists(KOKORO_VOICES):
-    raise SystemExit(
-        f"Missing kokoro model files. Need '{KOKORO_MODEL}' and '{KOKORO_VOICES}' "
-        f"next to main.py. Grab them from the kokoro-onnx github releases."
-    )
+def fetch_kokoro_files():
+    """Pull the model/voice files off the releases page if they aren't here yet."""
+    for path, url in ((KOKORO_MODEL, f"{KOKORO_RELEASE}/kokoro-v1.0.onnx"),
+                      (KOKORO_VOICES, f"{KOKORO_RELEASE}/voices-v1.0.bin")):
+        if os.path.exists(path):
+            continue
+
+        name = os.path.basename(path)
+        print(f"[tts] {name} is missing, downloading it from {url} (big file, give it a minute)")
+        tmp = path + ".part"
+        try:
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                done = 0
+                next_mark = 10
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                        done += len(chunk)
+                        pct = done * 100 // total if total else 0
+                        if pct >= next_mark:
+                            print(f"[tts] {name}: {pct}%")
+                            next_mark = pct - pct % 10 + 10
+            # a truncated model file just explodes later with a confusing onnx error, catch it here
+            if total and done != total:
+                raise IOError(f"only got {done} of {total} bytes")
+            os.replace(tmp, path)
+            print(f"[tts] {name} downloaded")
+        except Exception as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise SystemExit(
+                f"Couldn't download {name} ({e}). Grab it from the kokoro-onnx github "
+                f"releases manually and drop it next to main.py."
+            )
+
+fetch_kokoro_files()
 kokoro = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
 
 # windows ships opus with py-cord, linux needs the system lib (apt install libopus0)
@@ -124,6 +164,7 @@ if sys.platform.startswith("linux") and not discord.opus.is_loaded():
 tts_enabled = set()   # where /ai_tts is ran (aka enabled)
 tts_queues = {}       # guild_id -> asyncio.Queue of strings waiting to be spoken
 tts_workers = {}      # guild_id -> the asyncio.Task draining that queue
+tts_voices = {}       # guild_id -> a key of TTS_VOICES, whatever /ai_tts was called with
 
 def load_usage():
     if not os.path.exists(USAGE_FILE):
@@ -178,14 +219,15 @@ def split_msg(text: str, limit: int = 2000) -> list[str]:
     return [c for c in out if c.strip()] 
 
 
-async def synth(text: str):
+async def synth(text: str, voice_key: str = TTS_DEFAULT_VOICE):
     """kokoro -> raw float32 PCM in memory. Returns (buffer, sample_rate)."""
+    voice, lang = TTS_VOICES.get(voice_key, TTS_VOICES[TTS_DEFAULT_VOICE])
     samples, sample_rate = await asyncio.to_thread(
         kokoro.create,
         text,
-        voice=TTS_VOICE,
+        voice=voice,
         speed=TTS_SPEED,
-        lang=TTS_LANG,
+        lang=lang,
     )
     pcm = np.clip(samples, -1.0, 1.0).astype(np.float32).tobytes()
     return io.BytesIO(pcm), sample_rate
@@ -205,7 +247,8 @@ async def tts_worker(guild_id: int):
 
                 # timeout so one pathological input can't park this worker forever
                 audio, sample_rate = await asyncio.wait_for(
-                    synth(text), timeout=SYNTH_TIMEOUT
+                    synth(text, tts_voices.get(guild_id, TTS_DEFAULT_VOICE)),
+                    timeout=SYNTH_TIMEOUT,
                 )
 
                 done = asyncio.Event()
@@ -356,7 +399,8 @@ async def reset(ctx: discord.ApplicationContext):
 
 
 @bot.slash_command(name="ai_tts", description="Joins VC and reads new AI replies out loud (doesnt work with the User App)") # please work istg
-async def ai_tts(ctx: discord.ApplicationContext):
+@discord.option("voice", description="Which voice to read replies in", choices=list(TTS_VOICES), required=False, default=TTS_DEFAULT_VOICE)
+async def ai_tts(ctx: discord.ApplicationContext, voice: str):
     await ctx.defer()
 
     if not ctx.guild:
@@ -370,8 +414,17 @@ async def ai_tts(ctx: discord.ApplicationContext):
     elif ctx.author.voice.channel.id != vc.channel.id:
         return await ctx.respond("You must be in the same VC as the bot.")
 
+    if voice not in TTS_VOICES:
+        voice = TTS_DEFAULT_VOICE
+
+    switched = ctx.guild.id in tts_enabled and tts_voices.get(ctx.guild.id, TTS_DEFAULT_VOICE) != voice
+
+    tts_voices[ctx.guild.id] = voice   # the worker picks this up on the next line it speaks
     tts_enabled.add(ctx.guild.id)
-    await ctx.respond(f"TTS on. Reading replies in {vc.channel.mention}.")
+
+    if switched:
+        return await ctx.respond(f"Switched the voice to **{voice}** in {vc.channel.mention}.")
+    await ctx.respond(f"TTS on with the **{voice}** voice. Reading replies in {vc.channel.mention}.")
 
 @bot.slash_command(name="server_info", description="Gets information on a server.")
 async def server_info(ctx: discord.ApplicationContext):
@@ -534,6 +587,7 @@ async def ai_tts_stop(ctx: discord.ApplicationContext):
     if worker:
         worker.cancel()
     tts_queues.pop(ctx.guild.id, None)
+    tts_voices.pop(ctx.guild.id, None)
 
     vc = ctx.voice_client
     if vc and vc.is_connected():
@@ -579,7 +633,8 @@ async def debugging(ctx: discord.ApplicationContext):
         return await ctx.respond("you're not a bot owner lil bro")
 
     lines = [
-        f"tts voice: {TTS_VOICE} @ {TTS_SPEED}x",
+        f"tts voices: {', '.join(TTS_VOICES)} @ {TTS_SPEED}x (default {TTS_DEFAULT_VOICE})",
+        f"per-guild voice: {tts_voices or 'none set'}",
         f"tts enabled in guilds: {sorted(tts_enabled)}",
         f"limits: prompt {MAX_PROMPT_CHARS} chars / {OLLAMA_NUM_PREDICT} tokens / {OLLAMA_TIMEOUT}s",
     ]

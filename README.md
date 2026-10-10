@@ -6,7 +6,7 @@ it runs fully local with [ollama](https://ollama.com), so no API keys or paying 
 ## what it can do
 - **talk to you** with `/ask`, it remembers your last few messages so you can actually have a convo
 - **look at images**, attach one to `/ask` and it switches to gemma 3 to see what's in it
-- **read its replies out loud in VC** with `/ai_tts`, using [kokoro](https://github.com/thewh1teagle/kokoro-onnx) tts (also local)
+- **read its replies out loud in VC** with `/ai_tts`, using [kokoro](https://github.com/thewh1teagle/kokoro-onnx) tts (also local), in english or french
 - **server info**, shows member count, bot count and stuff
 - works as a **server bot AND a user app**, so you can use it pretty much anywhere (except tts, that needs a server VC)
 
@@ -15,7 +15,7 @@ it runs fully local with [ollama](https://ollama.com), so no API keys or paying 
 |---|---|
 | `/ask <prompt> [image]` | ask the AI something, optionally with an image |
 | `/reset` | wipes your conversation history (it forgets you exist) |
-| `/ai_tts` | joins your VC and reads every new AI reply out loud |
+| `/ai_tts [voice]` | joins your VC and reads every new AI reply out loud, pick english or french |
 | `/ai_tts_stop` | stops the tts and leaves the VC |
 | `/server_info` | gets info on the current server |
 | `/up` | owner only, syncs commands + reloads extensions |
@@ -26,6 +26,7 @@ it runs fully local with [ollama](https://ollama.com), so no API keys or paying 
 - replies are capped at **800 tokens** and the AI gets **95 seconds** before it gives up
 - chat history keeps your last **10 messages**, older ones get dropped
 - tts reads up to **400 characters** per reply and only queues **5 lines** at once, extra ones get skipped
+- the tts voice is per server, so one server can be on french while another is on english
 
 you can change all of these at the top of `main.py`
 
@@ -34,7 +35,7 @@ you can change all of these at the top of `main.py`
 - [uv](https://docs.astral.sh/uv/)
 - [ollama](https://ollama.com) with `llama3.1:8b` and `gemma3:4b` pulled
 - ffmpeg (for tts)
-- the kokoro model files `kokoro-v1.0.onnx` and `voices-v1.0.bin` next to `main.py`, grab them from the [kokoro-onnx releases](https://github.com/thewh1teagle/kokoro-onnx/releases)
+- nothing for tts, the kokoro model files (`kokoro-v1.0.onnx` and `voices-v1.0.bin`, ~350MB total) download themselves on first run if they aren't next to `main.py` already
 - a `.env` file next to `main.py` with your bot token in it:
   ```
   bot_token_dontleak=your_token_here
