@@ -103,6 +103,8 @@ OLLAMA_NUM_PREDICT = 800
 OLLAMA_TIMEOUT = 95       # seconds before we give up on a generation
 SYNTH_TIMEOUT = 35        # seconds before we give up on one tts clip
 TTS_QUEUE_MAX = 5         # drop new lines once this many are already waiting
+VIDEO_POLL_EVERY = 5      # seconds between asking openrouter if the video is done
+VIDEO_MAX_WAIT = 10 * 60  # give up waiting after this (interaction tokens die at 15min)
 
 # ---------- kokoro tts config ----------
 KOKORO_MODEL  = os.path.join(BASE_DIR, "kokoro-v1.0.onnx")
@@ -359,6 +361,10 @@ async def log_every_command(ctx):
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
   print(f"Node with ID {payload.session_id} has connected")
   print(f"Resumed session: {payload.resumed}")
+
+@bot.user_command(name="Who is this")  # create a user command for the supplied guilds
+async def account_creation_date(ctx, member: discord.Member):  # user commands return the member
+    await ctx.respond(f"This user is {member.name} ({member.id}), his account was made {member.created_at.isoformat}, he has this avatar: {member.avatar}, his current activity is: {member.activity}, he's on {member.desktop_status if member.desktop_status else "idk"}")
 
 @bot.slash_command(name="opt_in", description="Opt in to getting logged.")
 async def opt_in(ctx: discord.ApplicationContext):
@@ -688,8 +694,107 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
     file = discord.File(io.BytesIO(data), filename=f"{random.randint(100,100000000000)}_generated.png")
     await msg.edit(content="The image has finished generating!", file=file)
 
+@generatecommand.command()
+@discord.option("prompt", description="The prompt for the video")
+@discord.option("provider", description="The provider to use", choices=["OpenRouter (Paid)", "Fal (Paid)"])
+async def video(ctx: discord.ApplicationContext, prompt: str, provider: str):
+    import random
+    await ctx.defer()
+    emojis = await ctx.bot.fetch_emojis()
+    if emojis:
+        loading_emoji = "<a:loading2:1545845203519283311>"  # app emoji
+    else:
+        loading_emoji = "<a:loading2:1545851854821396500>"  # guild emoji
 
+    msg = await ctx.respond(f"{loading_emoji}\nThe video is being generated, please wait...")
 
+    if provider == "Fal (Paid)":
+        return await msg.edit(content="Fal isn't wired up yet, use OpenRouter for now.")
+
+    if provider == "OpenRouter (Paid)":
+        WINDOW = 5 * 60 * 60   # 5 hours in seconds
+        MAX_USES = 5
+
+        uid = str(ctx.author.id)
+        donator = load_donator()
+        user = donator.get(uid)
+        now = time.time()
+
+        if not user or user["expires"] < now:
+            return await msg.edit(content="This provider is for donators only! [Donate](https://ko-fi.com/lampyt) to unlock it for 1 month.")
+
+        recent = [t for t in user["uses"] if now - t < WINDOW]
+
+        if len(recent) >= MAX_USES:
+            next_free = int(min(recent) + WINDOW)
+            return await msg.edit(content=f"You've used all {MAX_USES} premium gens! Next one frees up <t:{next_free}:R>.")
+
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "bytedance/seedance-2.0-fast",
+            "prompt": prompt,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            # video gen is a job, not a reply: submit it, then poll the url it hands back
+            async with session.post("https://openrouter.ai/api/v1/videos", headers=headers, json=payload) as resp:
+                result = await resp.json()
+                polling_url = result.get("polling_url")
+                if resp.status != 200 or not polling_url:
+                    return await msg.edit(content=f"OpenRouter said nah: {result.get('error', result)}")
+
+            print(f"[video] job {result.get('id')} submitted by {ctx.author.id}")
+
+            deadline = time.time() + VIDEO_MAX_WAIT
+            last_status = None
+            video_urls = []
+
+            while True:
+                if time.time() > deadline:
+                    return await msg.edit(content=f"The video took over {VIDEO_MAX_WAIT // 60} minutes so I stopped waiting. It might still finish on OpenRouter's side.")
+
+                await asyncio.sleep(VIDEO_POLL_EVERY)   # asyncio, not time.sleep, or the whole bot freezes
+
+                async with session.get(polling_url, headers={"Authorization": f"Bearer {api_key}"}) as resp:
+                    status_data = await resp.json()
+
+                status = status_data.get("status")
+                if status == "completed":
+                    video_urls = status_data.get("unsigned_urls") or []
+                    break
+                if status == "failed":
+                    return await msg.edit(content=f"The video failed to generate: {status_data.get('error', 'no error given')}")
+
+                # only edit when it actually changes, editing every 5s would eat ratelimits
+                if status != last_status:
+                    last_status = status
+                    await msg.edit(content=f"{loading_emoji}\nThe video is being generated, please wait... (status: {status})")
+
+            if not video_urls:
+                return await msg.edit(content="OpenRouter says it finished but gave me no video url, uhh")
+
+            async with session.get(video_urls[0]) as resp:
+                if resp.status != 200:
+                    return await msg.edit(content=f"Couldn't download the video, here's the url instead:\n{video_urls[0]}")
+                data = await resp.read()
+
+        donator = load_donator()
+        user = donator[uid]
+        now = time.time()
+        user["uses"] = [t for t in user["uses"] if now - t < WINDOW] + [now]
+        save_donator(donator)
+
+    # videos blow past the upload cap all the time, so fall back to just linking it
+    limit = ctx.guild.filesize_limit if ctx.guild else 10 * 1024 * 1024
+    if len(data) > limit:
+        return await msg.edit(content=f"The video is {len(data) / 1024 / 1024:.1f}MB which is over the {limit // 1024 // 1024}MB upload limit here, so here's the link instead:\n{video_urls[0]}")
+
+    file = discord.File(io.BytesIO(data), filename=f"{random.randint(100,100000000000)}_generated.mp4")
+    await msg.edit(content="The video has finished generating!", file=file)
 @bot.slash_command(name="ai_tts_stop", description="Stop reading replies out loud and leave the VC.")
 async def ai_tts_stop(ctx: discord.ApplicationContext):
     await ctx.defer()
