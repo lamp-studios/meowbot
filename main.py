@@ -329,9 +329,22 @@ async def on_ready():
 
 @bot.before_invoke
 async def log_every_command(ctx):
+    # subcommands fire this hook twice, once for the group and once for the
+    # actual command, skip the group pass so each run logs one line
+    if isinstance(ctx.command, discord.SlashCommandGroup):
+        return
+
     logged_ppl = load_logged()
-    if str(ctx.author.id) in logged_ppl:
-        print(f"{ctx.author.id} ({ctx.author.name}) ran /{ctx.command} in {ctx.guild.id}, {ctx.guild.name}")
+    if str(ctx.author.id) not in logged_ppl:
+        return
+
+    # ctx.command already stringifies to the qualified name ("generate image")
+    opts = " ".join(f"{o['name']}:{o.get('value')}" for o in (ctx.selected_options or []))
+    full = f"/{ctx.command} {opts}".rstrip()
+
+    where = f"{ctx.guild.id}, {ctx.guild.name}" if ctx.guild else "DMs"
+    print(f"{ctx.author.id} ({ctx.author.name}) ran {full} in {where}")
+
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
