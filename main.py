@@ -366,6 +366,15 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 async def account_creation_date(ctx, member: discord.Member):  # user commands return the member
     await ctx.respond(f"This user is {member.name} ({member.id}, {member.display_name}), his account was made {member.created_at.isoformat()}, he has this avatar: {member.avatar}, his current activity is: {member.activity}, he's on {member.desktop_status if member.desktop_status else "idk"}")
 
+@bot.slash_command(name="opt_out", description="Opt out from getting logged.")
+async def opt_out(ctx: discord.ApplicationContext):
+    await ctx.defer()
+    logged_ppl = load_logged()
+    if str(ctx.author.id) in logged_ppl:
+        logged_ppl.remove(str(ctx.author.id))
+        save_logged(logged_ppl)
+        await ctx.respond(content="You have been opted out.")
+
 @bot.slash_command(name="opt_in", description="Opt in to getting logged.")
 async def opt_in(ctx: discord.ApplicationContext):
     logged_ppl = load_logged()
