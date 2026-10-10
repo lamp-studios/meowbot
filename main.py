@@ -343,7 +343,7 @@ async def opt_in(ctx: discord.ApplicationContext):
         async def button_callback(self, button, interaction):
             if interaction.user.id == ctx.author.id:
                 await ctx.delete()
-                await start_logger(ctx.author.id)
+                await save_logged(str(ctx.author.id))
                 await interaction.response.send_message("From now on, you are now being logged by the bot, to opt-out, run /opt_out.")
             else:
                 await interaction.response.send_message(f"{interaction.user.mention} blud you didnt send the slash command", ephemeral=True)
