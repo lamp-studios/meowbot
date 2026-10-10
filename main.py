@@ -20,6 +20,7 @@ import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USAGE_FILE = "gen_usage.json"
 DONATOR_FILE = "donators.json"
+LOGGED_FILE = "logged.json"
 
 
 dotenv.load_dotenv(os.path.join(BASE_DIR, ".env"))
@@ -190,6 +191,19 @@ def save_donator(donator):
         json.dump(donator, f, indent=2)
     os.replace(tmp, DONATOR_FILE)
 
+def save_logged(user_id):
+    tmp = LOGGED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(user_id, f, indent=2)
+    os.replace(tmp, LOGGED_FILE)
+
+
+def load_logged():
+    if not os.path.exists(LOGGED_FILE):
+        return {}
+    with open(LOGGED_FILE) as f:
+        return json.load(f)
+
 
 def clean_for_tts(text: str) -> str:
     """Strip the stuff that sounds like garbage when read out loud."""
@@ -217,7 +231,6 @@ def split_msg(text: str, limit: int = 2000) -> list[str]:
         text = text[cut:].lstrip("\n")
     out.append(text)
     return [c for c in out if c.strip()] 
-
 
 async def synth(text: str, voice_key: str = TTS_DEFAULT_VOICE):
     """kokoro -> raw float32 PCM in memory. Returns (buffer, sample_rate)."""
@@ -271,6 +284,11 @@ async def tts_worker(guild_id: int):
         tts_queues.pop(guild_id, None)
         tts_workers.pop(guild_id, None)
 
+async def start_logger(user_ids):
+    for i in user_ids:
+        print(i)
+    
+
 
 async def tts_say(guild_id: int, text: str):
     """Queue a line. Spins up the worker for this guild if it isn't running."""
@@ -306,6 +324,7 @@ generatecommand = bot.create_group("generate", "Generative AI stuff")
 @bot.event
 async def on_ready():
     print(f"{bot.user}, {bot.user.id} is running")
+    await start_logger(load_logged())
     #await connect_nodes() # connect to the server
 
 @bot.event
@@ -315,12 +334,16 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 
 @bot.slash_command(name="opt_in", description="Opt in to getting logged.")
 async def opt_in(ctx: discord.ApplicationContext):
+    logged_ppl = load_logged()
+    if ctx.author.id in logged_ppl:
+        await ctx.respond("You are already being logged, use /opt_out to opt out.", ephemeral=True)
     await ctx.defer()
     class AreYouSure(discord.ui.View):
         @discord.ui.button(label="Yes", style=discord.ButtonStyle.primary, emoji="❗")
         async def button_callback(self, button, interaction):
             if interaction.user.id == ctx.author.id:
                 await ctx.delete()
+                await start_logger(ctx.author.id)
                 await interaction.response.send_message("From now on, you are now being logged by the bot, to opt-out, run /opt_out.")
             else:
                 await interaction.response.send_message(f"{interaction.user.mention} blud you didnt send the slash command", ephemeral=True)
