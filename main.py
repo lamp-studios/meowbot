@@ -330,7 +330,7 @@ async def on_ready():
 @bot.before_invoke
 async def log_every_command(ctx):
     logged_ppl = load_logged()
-    if logged_ppl.get(str(ctx.author.id)):
+    if str(ctx.author.id) in logged_ppl:
         print(f"{ctx.author.id} ({ctx.author.name}) ran /{ctx.command.name} in {ctx.guild.id}, {ctx.guild.name}")
 
 @bot.event
