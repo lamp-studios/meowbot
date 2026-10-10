@@ -364,7 +364,7 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 
 @bot.user_command(name="Who is this")  # create a user command for the supplied guilds
 async def account_creation_date(ctx, member: discord.Member):  # user commands return the member
-    await ctx.respond(f"This user is {member.name} ({member.id}), his account was made {member.created_at.isoformat}, he has this avatar: {member.avatar}, his current activity is: {member.activity}, he's on {member.desktop_status if member.desktop_status else "idk"}")
+    await ctx.respond(f"This user is {member.name} ({member.id}), his account was made {member.created_at.isoformat()}, he has this avatar: {member.avatar}, his current activity is: {member.activity}, he's on {member.desktop_status if member.desktop_status else "idk"}")
 
 @bot.slash_command(name="opt_in", description="Opt in to getting logged.")
 async def opt_in(ctx: discord.ApplicationContext):
