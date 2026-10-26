@@ -105,9 +105,9 @@ bot_msgs = {}  # our own message id -> the user id whose history it came from
 BOT_MSG_MEMORY = 500  # how many of those ids to keep before forgetting the oldest
 
 # ---------- limits ----------
-MAX_PROMPT_CHARS = 700    # reject absurd prompts before they reach ollama
+MAX_PROMPT_CHARS = 730    # reject absurd prompts before they reach ollama
 OLLAMA_NUM_PREDICT = 800 
-OLLAMA_TIMEOUT = 95       # seconds before we give up on a generation
+OLLAMA_TIMEOUT = 100       # seconds before we give up on a generation
 SYNTH_TIMEOUT = 35        # seconds before we give up on one tts clip
 TTS_QUEUE_MAX = 5         # drop new lines once this many are already waiting
 VIDEO_POLL_EVERY = 5      # seconds between asking openrouter if the video is done
@@ -121,6 +121,10 @@ FREE_GENS_PER_DAY = 8     # cloudflare gens per person per day before they're cu
 CHAT_MODEL = "qwen3.5:4b"
 #CHAT_MODEL = "llama3.1:8b"   # good, uncomment if you want llama back
 #VISION_MODEL = "gemma3:4b"   # not needed, qwen3.5 reads images itself
+
+# qwen3.5 is a hybrid thinking model and reasons before answering by default, which burns
+# time and gpu for a chat bot. False turns that off, or use 'low'/'medium'/'high' to dial it
+CHAT_THINK = 'low'
 
 # /definition's whole job is inventing fake definitions and pronunciations, which a stock
 # model hedges on or refuses, so that one command keeps the abliterated model
@@ -450,6 +454,7 @@ async def on_message(message: discord.Message):
                     model=model,
                     messages=to_send,
                     stream=False,
+                    think=CHAT_THINK,
                     options={"num_predict": OLLAMA_NUM_PREDICT},
                 ),
                 timeout=OLLAMA_TIMEOUT,
@@ -588,6 +593,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
                 model=model,
                 messages=to_send,
                 stream=False,
+                think=CHAT_THINK,
                 options={"num_predict": OLLAMA_NUM_PREDICT},
             ),
             timeout=OLLAMA_TIMEOUT,
