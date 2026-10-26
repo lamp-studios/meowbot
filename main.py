@@ -46,20 +46,17 @@ bot = discord.Bot(
 # TODO: Add mention-for-reply feature
 
 def soggy_cat_api_tool():
-    """Returns the URL of a random Soggy cat (Caesar) photo.
+    """Fetches a random Soggy cat (Caesar) photo and returns its URL.
 
-    Call this ONLY when the user is asking to see a picture right now. That includes
-    follow-ups that don't name him, like "another one", "more pics", "again", "one more".
+    Use this whenever the user asks to see a soggy cat picture, including follow-ups that
+    don't name him, like "another one", "more pics" or "again".
 
-    Do NOT call it otherwise. Not to greet someone, not to talk about soggy cat, not to
-    answer a question about him, not to decorate a reply about something else. If the
-    user did not ask for a picture, just reply with words and no tool call.
-
-    Never write an image link yourself. The picture is posted automatically from this
-    tool's result, so just say something short and leave the link out.
+    If they are not asking for a picture, skip the tool and just reply with words.
     """
-    # everything above the Args:/Returns: heading becomes the tool description the model
-    # reads, so the 'only when asked' part has to live up there, not under Returns:
+    # this whole docstring (everything above an Args:/Returns: heading) is the tool
+    # description the model reads. keep it mostly positive: a description that is a wall of
+    # 'do NOT' makes a small model stop calling the tool at all. the 'don't write the link
+    # yourself' rule lives in strip_soggy_urls instead, where it's enforced rather than asked
     soggy_cat_api = "https://soggyapi.sillycat.cloud/img"
     r = requests.get(soggy_cat_api)
     r2 = r.json()["url"]
