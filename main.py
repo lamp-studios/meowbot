@@ -350,24 +350,49 @@ async def on_message(message: discord.Message):
 
     # <@id> is the normal form, <@!id> is the old nickname one discord still sends sometimes
     pings = (f"<@{bot.user.id}>", f"<@!{bot.user.id}>")
-    if not content.startswith(pings):
+    mentioned = content.startswith(pings)
+
+    # replying to something the bot said continues the convo, no ping needed
+    replied = None
+    ref = message.reference
+    if not mentioned and ref and ref.type is discord.MessageReferenceType.default:
+        replied = ref.resolved   # discord usually ships the replied-to message with the event
+        if replied is None and ref.message_id:
+            try:
+                replied = await message.channel.fetch_message(ref.message_id)
+            except discord.HTTPException:
+                replied = None
+        # a deleted parent comes back as DeletedReferencedMessage, which has no .author
+        if not isinstance(replied, discord.Message) or replied.author.id != bot.user.id:
+            replied = None
+
+    if not mentioned and replied is None:
         return
 
+    prompt = content
     for ping in pings:
         if content.startswith(ping):
             prompt = content[len(ping):].strip()
             break
 
     if not prompt:
-        return await message.reply("you pinged me but didnt say anything lil bro")
+        return await message.reply("you didnt say anything lil bro")
 
     if len(prompt) > MAX_PROMPT_CHARS:
         return await message.reply(
             f"that prompt is {len(prompt)} characters, keep it under {MAX_PROMPT_CHARS} lil bro"
         )
 
-    # same history store as /ask, so pinging and /ask are one conversation per person
+    # keyed on whoever is talking, so everyone keeps their own thread with the bot
+    # (and it's the same store /ask uses, so both surfaces share one convo per person)
     history = get_history(message.author.id)
+
+    # they might be replying to a line the bot said to SOMEONE ELSE, which isn't in
+    # their own history, so drop it in first or the model answers with no context
+    if replied is not None and replied.content:
+        last_said = next((m['content'] for m in reversed(history) if m['role'] == 'assistant'), None)
+        if replied.content != last_said:
+            history.append({'role': 'assistant', 'content': replied.content})
 
     user_msg = {'role': 'user', 'content': f"<@{message.author.id}>: {prompt}"}
 
