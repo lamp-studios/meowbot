@@ -1,6 +1,5 @@
 import time
 import dotenv, os, sys, discord
-import ollama
 import json
 import cv2
 import base64
@@ -15,6 +14,7 @@ import requests
 from discord.ui import DesignerView, Container, TextDisplay, Separator, Section, Button
 from discord.ext import commands
 import datetime
+import inspect
 
 # resolve files relative to this script so it works no matter where it's launched from (systemd, cron, etc)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -125,15 +125,33 @@ BOT_MSG_MEMORY = 500  # how many of those ids to keep before forgetting the olde
 
 # ---------- limits ----------
 MAX_PROMPT_CHARS = 730    # reject absurd prompts before they reach ollama
-OLLAMA_NUM_PREDICT = 800 
-OLLAMA_TIMEOUT = 100       # seconds before we give up on a generation
-SYNTH_TIMEOUT = 35        # seconds before we give up on one tts clip
+OLLAMA_NUM_PREDICT = 2000  # shared by the thinking AND the reply. at 800 the reasoning
+                           # ate the whole budget and content came back empty
+OLLAMA_TIMEOUT = 200       # seconds before we give up on a generation
+SYNTH_TIMEOUT = 50        # seconds before we give up on one tts clip
 TTS_QUEUE_MAX = 5         # drop new lines once this many are already waiting
 VIDEO_POLL_EVERY = 5      # seconds between asking openrouter if the video is done
 VIDEO_MAX_WAIT = 10 * 60  # give up waiting after this (interaction tokens die at 15min)
 HORDE_POLL_EVERY = 5      # seconds between asking ai horde how the queue is going
 HORDE_MAX_WAIT = 10 * 60  # the free queue can be brutal, but 15min is the hard ceiling
 FREE_GENS_PER_DAY = 8     # cloudflare gens per person per day before they're cut off
+
+# ---------- ollama ----------
+# we talk to the http api directly rather than through the sync client, see ollama_chat()
+OLLAMA_HOST = os.getenv("OLLAMA_HOST") or "127.0.0.1:11434"
+if "://" not in OLLAMA_HOST:
+    OLLAMA_HOST = f"http://{OLLAMA_HOST}"
+OLLAMA_URL = OLLAMA_HOST.rstrip("/")
+
+# built from the function's own docstring, so that stays the single source of truth
+SOGGY_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": soggy_cat_api_tool.__name__,
+        "description": inspect.getdoc(soggy_cat_api_tool),
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
 
 # ---------- models ----------
 # qwen3.5 is multimodal and does tool calling, so one model covers text and images
@@ -144,8 +162,8 @@ CHAT_MODEL = "qwen3.5:4b"
 # qwen3.5 is a hybrid thinking model and reasons before answering by default, which burns
 # time and gpu for a chat bot. only the bool False actually turns it OFF, the strings
 # 'low'/'medium'/'high' are effort levels and all of them still think first
-CHAT_THINK = False
-TOOL_ROUNDS_MAX = 3   # tool calls allowed in one reply before we make it answer with words
+CHAT_THINK = 'low'    # 'low' is the least thinking there is, below that is only False
+TOOL_ROUNDS_MAX = 2   # tool calls allowed in one reply before we make it answer with words
 
 # /definition's whole job is inventing fake definitions and pronunciations, which a stock
 # model hedges on or refuses, so that one command keeps the abliterated model
@@ -401,6 +419,33 @@ def soggy_lore_for(prompt):
     return []
 
 
+async def ollama_chat(model, messages, tools=None, think=None):
+    """POST /api/chat over aiohttp. Returns the response's message dict.
+
+    This exists instead of ollama.chat because the sync client has to run inside
+    asyncio.to_thread, and asyncio cannot interrupt a thread: a timeout abandoned the wait
+    while the generation carried on holding the gpu, so retries piled up behind it. An
+    aiohttp request IS cancellable, so wait_for now really does stop the work.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "think": CHAT_THINK if think is None else think,
+        "options": {"num_predict": OLLAMA_NUM_PREDICT},
+    }
+    if tools:
+        payload["tools"] = tools
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{OLLAMA_URL}/api/chat", json=payload) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"ollama {resp.status}: {(await resp.text())[:300]}")
+            data = await resp.json()
+
+    return data.get("message") or {}
+
+
 async def chat_with_tools(model, messages):
     """ollama.chat, looping while the model keeps asking for a tool.
 
@@ -421,41 +466,27 @@ async def chat_with_tools(model, messages):
     tools_used = []
 
     for _ in range(TOOL_ROUNDS_MAX):
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model=model,
-            messages=convo,
-            stream=False,
-            think=CHAT_THINK,
-            tools=[soggy_cat_api_tool],
-            options={"num_predict": OLLAMA_NUM_PREDICT},
-        )
+        msg = await ollama_chat(model, convo, tools=[SOGGY_TOOL_SCHEMA])
 
         # anything that isn't our tool is a made up name, ignore it
-        calls = [c for c in (response.message.tool_calls or [])
-                 if c.function.name == "soggy_cat_api_tool"]
+        calls = [c for c in (msg.get("tool_calls") or [])
+                 if (c.get("function") or {}).get("name") == "soggy_cat_api_tool"]
         if not calls:
-            return str(response.message.content), soggy_urls, tools_used
+            return str(msg.get("content") or ""), soggy_urls, tools_used
 
-        convo.append(response.message)
+        convo.append(msg)
         for call in calls:
+            name = call["function"]["name"]
             url = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
             soggy_urls.append(url)
-            if call.function.name not in tools_used:
-                tools_used.append(call.function.name)
-            convo.append({'role': 'tool', 'tool_name': call.function.name, 'content': url})
+            if name not in tools_used:
+                tools_used.append(name)
+            convo.append({'role': 'tool', 'tool_name': name, 'content': url})
 
     # it just kept calling the tool, so take one more round with no tools offered, which
     # leaves it nothing to do but write the reply
-    response = await asyncio.to_thread(
-        ollama.chat,
-        model=model,
-        messages=convo,
-        stream=False,
-        think=CHAT_THINK,
-        options={"num_predict": OLLAMA_NUM_PREDICT},
-    )
-    return str(response.message.content), soggy_urls, tools_used
+    msg = await ollama_chat(model, convo)
+    return str(msg.get("content") or ""), soggy_urls, tools_used
 
 def trim(history):
     if len(history) > MAX_TURNS + 1:
@@ -786,14 +817,9 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
     model = DEFINITION_MODEL
     user_msg = [{'role': 'system', 'content': DEFINITION_SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
     try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                ollama.chat,
-                model=model,
-                messages=user_msg,
-                stream=False,
-                options={"num_predict": OLLAMA_NUM_PREDICT},
-            ),
+        # think=False here: a definition is two lines, it doesn't need to reason about them
+        msg = await asyncio.wait_for(
+            ollama_chat(model, user_msg, think=False),
             timeout=OLLAMA_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -802,7 +828,7 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
         print(f"[ollama] error: {e}")
         return await msg.edit(content="the AI broke. check the console.")
 
-    text = str(response.message.content)
+    text = str(msg.get("content") or "")
     print(text)
     text2 = f"Definition for '{prompt}'\n{text}"
     if not text.startswith("Def"):
