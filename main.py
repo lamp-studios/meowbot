@@ -123,6 +123,14 @@ horde_cancelled = set()  # job ids someone ran /stop_job on. cancelling server s
                          # so the poll loop has to watch this instead
 BOT_MSG_MEMORY = 500  # how many of those ids to keep before forgetting the oldest
 
+DESCRIBE_SYSTEM_PROMPT = """You describe a discord member from the facts you are given.
+Write a few short playful sentences about them, in your usual voice.
+Only use the facts in the message. Do not invent anything else about them: no job, age,
+location, personality traits or opinions that aren't in the facts. If a fact says unknown,
+skip it instead of guessing. Don't list the raw fields back, and keep it under 1000
+characters.
+"""
+
 # ---------- limits ----------
 MAX_PROMPT_CHARS = 730    # reject absurd prompts before they reach ollama
 OLLAMA_NUM_PREDICT = 2000  # shared by the thinking AND the reply. at 800 the reasoning
@@ -674,6 +682,64 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
 @bot.user_command(name="Who is this")  # create a user command for the supplied guilds
 async def account_creation_date(ctx, member: discord.Member):  # user commands return the member
     await ctx.respond(f"This user is {member.name} ({member.id}, {member.display_name}), his account was made {member.created_at.isoformat()}, he has this avatar: {member.avatar}, his current activity is: {member.activity}, he's on {member.desktop_status if member.desktop_status else "idk"}")
+
+@bot.user_command(name="Describe this user")
+async def describe(ctx, member: discord.Member):
+    await ctx.defer()
+
+    emojis = await ctx.bot.fetch_emojis() # it's SLOOOOOWWWW but atleast i dont have to do it everytime the bot starts, which could delay everything else
+    if emojis:
+        loading_emoji = "<a:loading2:1545845203519283311>"  # app emoji
+    else:
+        loading_emoji = "<a:loading2:1545851854821396500>"  # guild emoji
+
+    msg = await ctx.respond(f"{loading_emoji}\nThe AI is describing, please wait...")
+
+    # a user command used from a DM or another server hands back a User, not a Member, so
+    # joined_at and status aren't there and plain attribute access would blow up
+    joined = getattr(member, "joined_at", None)
+    facts = [
+        f"id: {member.id}",
+        f"username: {member.name}",
+        f"display name: {member.display_name}",
+        f"account made: {member.created_at.isoformat()}",
+        f"joined this server: {joined.isoformat() if joined else 'unknown'}",
+        f"status: {getattr(member, 'status', None) or 'unknown'}",
+        f"activity: {getattr(member, 'activity', None) or 'nothing'}",
+    ]
+    user_msg = {'role': 'user', 'content': "Describe this member:\n" + "\n".join(facts)}
+
+    model = CHAT_MODEL
+    messages = [
+        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'system', 'content': DESCRIBE_SYSTEM_PROMPT},
+        user_msg,
+    ]
+
+    try:
+        # think=False: it's one short description, reasoning about it just doubles the wait
+        reply = await asyncio.wait_for(
+            ollama_chat(model, messages, think=False),
+            timeout=OLLAMA_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return await msg.edit(content="the AI took too long and I gave up.")
+    except Exception as e:
+        print(f"[ollama] error: {e}")
+        return await msg.edit(content="the AI broke. check the console.")
+
+    text = strip_soggy_urls(str(reply.get("content") or ""))
+    print(text)
+
+    if not text.strip():
+        text = "uhh i got nothing, try again?"
+
+    # it can ping the person it just described, but not the whole server
+    no_mass_pings = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
+    chunks = split_msg(text)
+    await msg.edit(content=chunks[0], allowed_mentions=no_mass_pings)
+    for extra in chunks[1:]:
+        await ctx.followup.send(extra, allowed_mentions=no_mass_pings)
 
 @bot.slash_command(name="opt_out", description="Opt out from getting logged.")
 async def opt_out(ctx: discord.ApplicationContext):
