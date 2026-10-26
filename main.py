@@ -118,7 +118,7 @@ FREE_GENS_PER_DAY = 8     # cloudflare gens per person per day before they're cu
 
 # ---------- models ----------
 # qwen3.5 is multimodal and does tool calling, so one model covers text and images
-CHAT_MODEL = "qwen3.5:9b"
+CHAT_MODEL = "qwen3.5:4b"
 #CHAT_MODEL = "llama3.1:8b"   # good, uncomment if you want llama back
 #VISION_MODEL = "gemma3:4b"   # not needed, qwen3.5 reads images itself
 
