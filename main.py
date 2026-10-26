@@ -15,6 +15,7 @@ from discord.ui import DesignerView, Container, TextDisplay, Separator, Section,
 from discord.ext import commands
 import datetime
 import inspect
+from collections import deque
 
 # resolve files relative to this script so it works no matter where it's launched from (systemd, cron, etc)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +114,14 @@ the new Twitter account under the sillyfuny handle isn't Biscuit, just someone e
 
 # what counts as the user bringing him up
 SOGGY_WORDS = ("soggy", "caesar", "sillyfuny", "biscuit", "wet cat")
+
+# logged.json now holds CHANNEL ids, not user ids: /opt_in is a manage-server action that
+# turns logging on for one channel. mirrored into a set so on_message doesn't hit the disk
+# for every single message
+logged_channels = set()
+channel_logs = {}             # channel id -> deque of recent 'name: text' lines
+CHANNEL_CONTEXT_MAX = 30      # how many recent messages to remember per channel
+CHANNEL_CONTEXT_CHARS = 3000  # and a character ceiling, so a busy channel can't flood the prompt
 
 histories = {} # chat history for previous messages
 MAX_TURNS = 10
@@ -382,9 +391,14 @@ async def tts_worker(guild_id: int):
         tts_queues.pop(guild_id, None)
         tts_workers.pop(guild_id, None)
 
-async def start_logger(user_ids):
-    for i in user_ids:
-        print(i)
+async def start_logger(channel_ids):
+    """Load the opted-in channels off disk into the set on_message checks."""
+    logged_channels.clear()
+    logged_channels.update(str(c) for c in channel_ids)
+    if logged_channels:
+        print(f"[logger] logging {len(logged_channels)} channel(s): {sorted(logged_channels)}")
+    else:
+        print("[logger] no channels opted in")
     
 
 
@@ -415,6 +429,31 @@ def get_history(user_id):
 def wants_soggy(prompt):
     """Whether the user brought soggy cat up at all."""
     return any(w in prompt.lower() for w in SOGGY_WORDS)
+
+def remember_channel_line(channel_id, who, text):
+    """Add a line to an opted-in channel's rolling log. No-op if it isn't opted in."""
+    if str(channel_id) not in logged_channels or not text:
+        return
+    log = channel_logs.setdefault(channel_id, deque(maxlen=CHANNEL_CONTEXT_MAX))
+    log.append(f"{who}: {text}")
+
+def channel_context_for(channel_id):
+    """The recent conversation in this channel, as one system message.
+
+    Rebuilt per request rather than appended to anyone's history: a shared channel log in a
+    personal thread would pollute it permanently and get duplicated on every turn.
+    """
+    log = channel_logs.get(channel_id)
+    if not log:
+        return []
+
+    lines = list(log)
+    # drop the oldest lines until it fits the character ceiling
+    while len(lines) > 1 and len("\n".join(lines)) > CHANNEL_CONTEXT_CHARS:
+        lines.pop(0)
+
+    return [{'role': 'system',
+             'content': "Recent conversation in this channel, for context:\n" + "\n".join(lines)}]
 
 def soggy_lore_for(prompt):
     """The soggy cat backstory as an extra system message, but only if they asked.
@@ -524,6 +563,10 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
 
+    # opted-in channels remember everything said in them, not just messages aimed at the
+    # bot, so a later /ask or ping can read back what people were talking about
+    remember_channel_line(message.channel.id, message.author.display_name, content)
+
     # <@id> is the normal form, <@!id> is the old nickname one discord still sends sometimes
     pings = (f"<@{bot.user.id}>", f"<@!{bot.user.id}>")
     mentioned = content.startswith(pings)
@@ -595,6 +638,7 @@ async def on_message(message: discord.Message):
     to_send = []
     for m in history[:-1]:
         to_send.append({'role': m['role'], 'content': m['content']})
+    to_send += channel_context_for(message.channel.id)   # empty unless the channel opted in
     to_send += soggy_lore_for(prompt)   # only when they actually mentioned him
     to_send.append(history[-1])
 
@@ -630,6 +674,9 @@ async def on_message(message: discord.Message):
         if vc and vc.is_connected():
             await tts_say(message.guild.id, text)
 
+    # its own replies go in the channel log too, or the context reads as one sided
+    remember_channel_line(message.channel.id, bot.user.display_name, text)
+
     # stored without links too, so the next turn has nothing to copy and has to use the tool
     history.append({'role': 'assistant', 'content': text})
     # drop the image from the stored version so it doesn't sit in memory forever
@@ -662,8 +709,7 @@ async def log_every_command(ctx):
     if isinstance(ctx.command, discord.SlashCommandGroup):
         return
 
-    logged_ppl = load_logged()
-    if str(ctx.author.id) not in logged_ppl:
+    if str(ctx.channel.id) not in logged_channels:
         return
 
     # ctx.command already stringifies to the qualified name ("generate image")
@@ -741,35 +787,69 @@ async def describe(ctx, member: discord.Member):
     for extra in chunks[1:]:
         await ctx.followup.send(extra, allowed_mentions=no_mass_pings)
 
-@bot.slash_command(name="opt_out", description="Opt out from getting logged.")
-async def opt_out(ctx: discord.ApplicationContext):
-    await ctx.defer()
-    logged_ppl = load_logged()
-    if str(ctx.author.id) in logged_ppl:
-        logged_ppl.remove(str(ctx.author.id))
-        save_logged(logged_ppl)
-        await ctx.respond(content="You have been opted out.")
+def can_manage(ctx):
+    """Whether this person is allowed to flip logging for the channel."""
+    return bool(ctx.guild) and ctx.author.guild_permissions.manage_guild
 
-@bot.slash_command(name="opt_in", description="Opt in to getting logged.")
+@bot.slash_command(name="opt_out", description="Stop logging this channel (needs Manage Server).")
+async def opt_out(ctx: discord.ApplicationContext):
+    if not ctx.guild:
+        return await ctx.respond("This only works in a server.", ephemeral=True)
+    if not can_manage(ctx):
+        return await ctx.respond("You need the Manage Server permission to change logging in here.", ephemeral=True)
+
+    await ctx.defer()
+    cid = str(ctx.channel.id)
+    logged = load_logged()
+    if cid not in logged:
+        return await ctx.respond("This channel isn't being logged.")
+
+    logged.remove(cid)
+    save_logged(logged)
+    logged_channels.discard(cid)
+    channel_logs.pop(ctx.channel.id, None)   # throw away what we already collected
+    print(f"[logger] channel {cid} opted out by {ctx.author.id}")
+    await ctx.respond(content="Logging is off for this channel, and what was collected has been dropped.")
+
+@bot.slash_command(name="opt_in", description="Let the bot read this channel for context (needs Manage Server).")
 async def opt_in(ctx: discord.ApplicationContext):
-    logged_ppl = load_logged()
-    if str(ctx.author.id) in logged_ppl:
-        return await ctx.respond("You are already being logged, use /opt_out to opt out.", ephemeral=True)
+    if not ctx.guild:
+        return await ctx.respond("This only works in a server.", ephemeral=True)
+    if not can_manage(ctx):
+        return await ctx.respond("You need the Manage Server permission to change logging in here.", ephemeral=True)
+
+    if str(ctx.channel.id) in logged_channels:
+        return await ctx.respond("This channel is already being logged, use /opt_out to stop.", ephemeral=True)
+
     await ctx.defer()
     class AreYouSure(discord.ui.View):
         @discord.ui.button(label="Yes", style=discord.ButtonStyle.primary, emoji="❗")
         async def button_callback(self, button, interaction):
-            if interaction.user.id == ctx.author.id:
-                await ctx.delete()
-                uid = str(ctx.author.id)
-                logged = load_logged()   # re-read, someone else could've opted in while this sat here
-                if uid not in logged:
-                    logged.append(uid)
-                    save_logged(logged)
-                await interaction.response.send_message("From now on, you are now being logged by the bot, to opt-out, run /opt_out.")
-            else:
-                await interaction.response.send_message(f"{interaction.user.mention} blud you didnt send the slash command", ephemeral=True)
-    await ctx.respond("**Are you sure you want to get logged from now on?** You can opt-out at any moment with /opt_out if you'd like.\nThis is absolutely not required and can be a risk to your privacy, because it logs the following: **Your messages with the AI AND possibly your outside messages, your images, the commands you ran and your user profile**.\nIf you're sure and want to opt-in anyways, click the 'Yes' button to confirm.", view=AreYouSure())
+            if interaction.user.id != ctx.author.id:
+                return await interaction.response.send_message(f"{interaction.user.mention} blud you didnt send the slash command", ephemeral=True)
+
+            await ctx.delete()
+            cid = str(ctx.channel.id)
+            logged = load_logged()   # re-read, another channel could've been added meanwhile
+            if cid not in logged:
+                logged.append(cid)
+                save_logged(logged)
+            logged_channels.add(cid)
+            print(f"[logger] channel {cid} opted in by {ctx.author.id}")
+            await interaction.response.send_message(
+                f"**This channel is now being logged.** Everything said here from now on is kept in memory "
+                f"(the last {CHANNEL_CONTEXT_MAX} messages) and handed to the AI as context when someone runs "
+                f"/ask or pings it in here. Anyone with Manage Server can turn it off with /opt_out."
+            )
+    await ctx.respond(
+        f"**Turn on logging for this channel?** This is not just about you: "
+        f"**everything everyone says in here** gets kept (the last {CHANNEL_CONTEXT_MAX} messages, in memory only) "
+        f"and sent to the AI as context whenever someone runs /ask or pings the bot in this channel.\n"
+        f"Commands run in here get logged to the console too.\n"
+        f"Anyone with Manage Server can undo it with /opt_out, which also throws away what was collected.\n"
+        f"If you're sure, click 'Yes'.",
+        view=AreYouSure(),
+    )
 @bot.slash_command(name="ask", description="Ask the AI.")
 @discord.option("prompt", type=discord.SlashCommandOptionType.string)
 @discord.option("image", required=False, type=discord.SlashCommandOptionType.attachment) # (apparently you have to put discord.Attachment twice for some reason)
@@ -808,6 +888,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     to_send = []
     for m in history[:-1]:
         to_send.append({'role': m['role'], 'content': m['content']})
+    to_send += channel_context_for(ctx.channel.id)   # empty unless the channel opted in
     to_send += soggy_lore_for(prompt)   # only when they actually mentioned him
     to_send.append(history[-1])
     try:
@@ -840,6 +921,10 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
         vc = ctx.voice_client
         if vc and vc.is_connected():
             await tts_say(ctx.guild.id, text)
+
+    # the question and its answer both join the channel log, same as a plain message would
+    remember_channel_line(ctx.channel.id, ctx.author.display_name, prompt)
+    remember_channel_line(ctx.channel.id, bot.user.display_name, text)
 
     # stored without links too, so the next turn has nothing to copy and has to use the tool
     history.append({'role': 'assistant', 'content': text})
