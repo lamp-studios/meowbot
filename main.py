@@ -65,7 +65,6 @@ def soggy_cat_api_tool():
     r2 = r.json()["url"]
     r2 = str(r2).replace(" ", "%20")
     return r2
-    
 
 
 async def connect_nodes():
@@ -408,7 +407,8 @@ def soggy_lore_for(prompt):
 async def chat_with_tools(model, messages):
     """ollama.chat, looping while the model keeps asking for a tool.
 
-    Returns (text, soggy_urls). soggy_urls is every picture the tool actually fetched.
+    Returns (text, soggy_urls, tools_used). soggy_urls is every picture the tool fetched,
+    tools_used is the tool names it called, in order, deduped.
 
     The tool is declared on EVERY round, including the ones after a tool already ran. If it
     isn't, the conversation ends up holding a tool call and a role:tool result that point at
@@ -421,6 +421,7 @@ async def chat_with_tools(model, messages):
     """
     convo = list(messages)   # a copy, the caller's history must stay free of tool traffic
     soggy_urls = []
+    tools_used = []
 
     for _ in range(TOOL_ROUNDS_MAX):
         response = await asyncio.to_thread(
@@ -437,12 +438,14 @@ async def chat_with_tools(model, messages):
         calls = [c for c in (response.message.tool_calls or [])
                  if c.function.name == "soggy_cat_api_tool"]
         if not calls:
-            return str(response.message.content), soggy_urls
+            return str(response.message.content), soggy_urls, tools_used
 
         convo.append(response.message)
         for call in calls:
             url = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
             soggy_urls.append(url)
+            if call.function.name not in tools_used:
+                tools_used.append(call.function.name)
             convo.append({'role': 'tool', 'tool_name': call.function.name, 'content': url})
 
     # it just kept calling the tool, so take one more round with no tools offered, which
@@ -455,7 +458,7 @@ async def chat_with_tools(model, messages):
         think=CHAT_THINK,
         options={"num_predict": OLLAMA_NUM_PREDICT},
     )
-    return str(response.message.content), soggy_urls
+    return str(response.message.content), soggy_urls, tools_used
 
 def trim(history):
     if len(history) > MAX_TURNS + 1:
@@ -562,7 +565,7 @@ async def on_message(message: discord.Message):
     try:
         async with message.channel.typing():   # the '...is typing' dots instead of a loading message
             # one timeout for the whole thing, tool round trip included
-            text, soggy_urls = await asyncio.wait_for(
+            text, soggy_urls, tools_used = await asyncio.wait_for(
                 chat_with_tools(model, to_send),
                 timeout=OLLAMA_TIMEOUT,
             )
@@ -602,6 +605,12 @@ async def on_message(message: discord.Message):
     # the real picture links, added after history and tts are done with the text
     for url in soggy_urls:
         text = f"{text}\n{url}"
+
+    # and a note above the reply saying what it used. display only, so it goes on here
+    # rather than into the history or the tts text
+    if tools_used:
+        note = "\n".join(f"> Tool called: {name}" for name in tools_used)
+        text = f"{note}\n{text}"
 
     # the system prompt teaches it <@id> syntax, so let it ping people but not the whole server
     no_mass_pings = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
@@ -709,7 +718,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     to_send.append(history[-1])
     try:
         # one timeout for the whole thing, tool round trip included
-        text, soggy_urls = await asyncio.wait_for(
+        text, soggy_urls, tools_used = await asyncio.wait_for(
             chat_with_tools(model, to_send),
             timeout=OLLAMA_TIMEOUT,
         )
@@ -749,6 +758,12 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     # the real picture links, added after history and tts are done with the text
     for url in soggy_urls:
         text = f"{text}\n{url}"
+
+    # and a note above the reply saying what it used. display only, so it goes on here
+    # rather than into the history or the tts text
+    if tools_used:
+        note = "\n".join(f"> Tool called: {name}" for name in tools_used)
+        text = f"{note}\n{text}"
 
     chunks = split_msg(text)
     remember_bot_msg(await msg.edit(content=chunks[0]), ctx.author.id)
