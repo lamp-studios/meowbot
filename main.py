@@ -54,6 +54,9 @@ def soggy_cat_api_tool():
     Do NOT call it otherwise. Not to greet someone, not to talk about soggy cat, not to
     answer a question about him, not to decorate a reply about something else. If the
     user did not ask for a picture, just reply with words and no tool call.
+
+    Never write an image link yourself. The picture is posted automatically from this
+    tool's result, so just say something short and leave the link out.
     """
     # everything above the Args:/Returns: heading becomes the tool description the model
     # reads, so the 'only when asked' part has to live up there, not under Returns:
@@ -260,6 +263,22 @@ def load_logged():
         return []
     with open(LOGGED_FILE) as f:
         return json.load(f)
+
+
+# any link to the soggy api, whatever domain the model decided on this time
+SOGGY_URL_RE = re.compile(r"https?://\S*soggyapi\S*", re.I)
+
+def strip_soggy_urls(text: str) -> str:
+    """Remove soggy api links the model wrote itself, because they are always wrong.
+
+    It copies the tool result with the domain mangled (soggyapi.sillyfuny.cloud, picking up
+    'sillyfuny' from the lore) or invents a filename off a link it saw earlier in the chat.
+    The real url is appended from the tool result instead, so its version is never useful.
+    """
+    text = SOGGY_URL_RE.sub("", text)
+    text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)   # space the link left behind
+    text = re.sub(r"\n{3,}", "\n\n", text)                   # and the blank gap it leaves
+    return text.strip()
 
 
 def clean_for_tts(text: str) -> str:
@@ -509,12 +528,16 @@ async def on_message(message: discord.Message):
     # their own history, so drop it in first or the model answers with no context
     if replied is not None and replied.content:
         last_said = next((m['content'] for m in reversed(history) if m['role'] == 'assistant'), None)
+        # strip the picture link out: if the model can see a soggy url in the conversation it
+        # copies it instead of calling the tool, which is how 'another one' produced a made up
+        # filename on an invented domain
+        replied_text = strip_soggy_urls(replied.content)
         # don't compare raw text: discord trims trailing whitespace off what we sent, and a
         # reply over 2000 chars only ever shows chunks[0], so neither ever matches what we
         # stored. the id map is the real answer, stripped text is the fallback after a restart
         mine = bot_msgs.get(replied.id) == message.author.id
-        if not mine and replied.content.strip() != (last_said or '').strip():
-            history.append({'role': 'assistant', 'content': replied.content})
+        if replied_text and not mine and replied_text != (last_said or '').strip():
+            history.append({'role': 'assistant', 'content': replied_text})
 
     user_msg = {'role': 'user', 'content': f"<@{message.author.id}>: {prompt}"}
 
@@ -553,29 +576,32 @@ async def on_message(message: discord.Message):
 
     print(text)
 
-    # if it fetched pictures but didn't put the links in, add them so they actually show up
-    for url in soggy_urls:
-        if url not in text:
-            text = f"{text}\n{url}"
+    # whatever link it wrote is wrong, drop it. the real one goes on at the very end
+    text = strip_soggy_urls(text)
 
     # a turn that only called a tool comes back with empty content, and split_msg drops
-    # blank chunks, so chunks[0] would IndexError. only reachable if it both said nothing
-    # and fetched nothing
+    # blank chunks, so chunks[0] would IndexError
     if not text.strip():
-        text = "uhh i got nothing, try again?"
+        text = "here you go!" if soggy_urls else "uhh i got nothing, try again?"
 
-    # speak it, if tts is on for this guild and we're actually in a vc
+    # speak it, if tts is on for this guild and we're actually in a vc. links are still out
+    # of the text at this point, which is what we want read aloud
     if message.guild and message.guild.id in tts_enabled:
         vc = message.guild.voice_client
         if vc and vc.is_connected():
             await tts_say(message.guild.id, text)
 
+    # stored without links too, so the next turn has nothing to copy and has to use the tool
     history.append({'role': 'assistant', 'content': text})
     # drop the image from the stored version so it doesn't sit in memory forever
     if 'images' in history[-2]:
         del history[-2]['images']
 
     trim(history)
+
+    # the real picture links, added after history and tts are done with the text
+    for url in soggy_urls:
+        text = f"{text}\n{url}"
 
     # the system prompt teaches it <@id> syntax, so let it ping people but not the whole server
     no_mass_pings = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
@@ -697,29 +723,32 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
 
     print(text)
 
-    # if it fetched pictures but didn't put the links in, add them so they actually show up
-    for url in soggy_urls:
-        if url not in text:
-            text = f"{text}\n{url}"
+    # whatever link it wrote is wrong, drop it. the real one goes on at the very end
+    text = strip_soggy_urls(text)
 
     # a turn that only called a tool comes back with empty content, and split_msg drops
-    # blank chunks, so chunks[0] would IndexError. only reachable if it both said nothing
-    # and fetched nothing
+    # blank chunks, so chunks[0] would IndexError
     if not text.strip():
-        text = "uhh i got nothing, try again?"
+        text = "here you go!" if soggy_urls else "uhh i got nothing, try again?"
 
-    # speak it, if tts is on for this guild and we're actually in a vc
+    # speak it, if tts is on for this guild and we're actually in a vc. links are still out
+    # of the text at this point, which is what we want read aloud
     if ctx.guild and ctx.guild.id in tts_enabled:
         vc = ctx.voice_client
         if vc and vc.is_connected():
             await tts_say(ctx.guild.id, text)
 
+    # stored without links too, so the next turn has nothing to copy and has to use the tool
     history.append({'role': 'assistant', 'content': text})
     # drop the image from the stored version so it doesn't sit in memory forever
     if 'images' in history[-2]:
         del history[-2]['images']
 
     trim(history)
+
+    # the real picture links, added after history and tts are done with the text
+    for url in soggy_urls:
+        text = f"{text}\n{url}"
 
     chunks = split_msg(text)
     remember_bot_msg(await msg.edit(content=chunks[0]), ctx.author.id)
