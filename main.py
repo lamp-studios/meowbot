@@ -972,7 +972,8 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
     user_msg = [{'role': 'system', 'content': DEFINITION_SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
     try:
         # think=False here: a definition is two lines, it doesn't need to reason about them
-        msg = await asyncio.wait_for(
+        # NOT named msg: that's the loading message we still need to edit further down
+        reply = await asyncio.wait_for(
             ollama_chat(model, user_msg, think=False),
             timeout=OLLAMA_TIMEOUT,
         )
@@ -982,7 +983,7 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
         print(f"[ollama] error: {e}")
         return await msg.edit(content="the AI broke. check the console.")
 
-    text = str(msg.get("content") or "")
+    text = str(reply.get("content") or "")
     print(text)
     text2 = f"Definition for '{prompt}'\n{text}"
     if not text.startswith("Def"):
