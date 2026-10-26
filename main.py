@@ -41,6 +41,9 @@ bot = discord.Bot(
     intents=discord.Intents.all(),
 
 )
+# TODO: Add change system prompt cmd (bot owner)
+# TODO: Add model change cmd (bot owner)
+# TODO: Add mention-for-reply feature
 
 def soggy_cat_api_tool():
     """Gets a random Soggy cat picture from the Soggy API
@@ -338,6 +341,96 @@ async def on_ready():
     await start_logger(load_logged())
     #await connect_nodes() # connect to the server
 
+@bot.listen()
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    content = message.content.strip()
+
+    # <@id> is the normal form, <@!id> is the old nickname one discord still sends sometimes
+    pings = (f"<@{bot.user.id}>", f"<@!{bot.user.id}>")
+    if not content.startswith(pings):
+        return
+
+    for ping in pings:
+        if content.startswith(ping):
+            prompt = content[len(ping):].strip()
+            break
+
+    if not prompt:
+        return await message.reply("you pinged me but didnt say anything lil bro")
+
+    if len(prompt) > MAX_PROMPT_CHARS:
+        return await message.reply(
+            f"that prompt is {len(prompt)} characters, keep it under {MAX_PROMPT_CHARS} lil bro"
+        )
+
+    # same history store as /ask, so pinging and /ask are one conversation per person
+    history = get_history(message.author.id)
+
+    user_msg = {'role': 'user', 'content': f"<@{message.author.id}>: {prompt}"}
+
+    image = next((a for a in message.attachments if (a.content_type or "").startswith("image/")), None)
+    if image:
+        image_bytes = await image.read()
+        image_data = base64.b64encode(image_bytes).decode("utf-8")
+        user_msg['images'] = [image_data]
+        model = 'gemma3:4b' # pain
+    else:
+        model = 'huihui_ai/qwen3-abliterated:8b'
+
+    history.append(user_msg)
+
+    # strip images out of OLD messages so history doesn't balloon
+    to_send = []
+    for m in history[:-1]:
+        to_send.append({'role': m['role'], 'content': m['content']})
+    to_send.append(history[-1])
+
+    try:
+        async with message.channel.typing():   # the '...is typing' dots instead of a loading message
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ollama.chat,
+                    model=model,
+                    messages=to_send,
+                    stream=False,
+                    options={"num_predict": OLLAMA_NUM_PREDICT},
+                ),
+                timeout=OLLAMA_TIMEOUT,
+            )
+    except asyncio.TimeoutError:
+        history.pop()
+        return await message.reply("the AI took too long and I gave up. try something shorter.")
+    except Exception as e:
+        history.pop()
+        print(f"[ollama] error: {e}")
+        return await message.reply("the AI broke. check the console.")
+
+    text = str(response.message.content)
+    print(text)
+
+    # speak it, if tts is on for this guild and we're actually in a vc
+    if message.guild and message.guild.id in tts_enabled:
+        vc = message.guild.voice_client
+        if vc and vc.is_connected():
+            await tts_say(message.guild.id, text)
+
+    history.append({'role': 'assistant', 'content': text})
+    # drop the image from the stored version so it doesn't sit in memory forever
+    if 'images' in history[-2]:
+        del history[-2]['images']
+
+    trim(history)
+
+    # the system prompt teaches it <@id> syntax, so let it ping people but not the whole server
+    no_mass_pings = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=True)
+    chunks = split_msg(text)
+    await message.reply(chunks[0], allowed_mentions=no_mass_pings)
+    for extra in chunks[1:]:
+        await message.channel.send(extra, allowed_mentions=no_mass_pings)
+
 @bot.before_invoke
 async def log_every_command(ctx):
     # subcommands fire this hook twice, once for the group and once for the
@@ -528,6 +621,11 @@ async def reset(ctx: discord.ApplicationContext):
     histories.pop(ctx.author.id, None)
     await ctx.respond("Memory wiped. Who are you again?")
 
+@bot.slash_command(name="change_model", description="Change the model.")
+async def change_model(ctx: discord.ApplicationContext):
+    if ctx.author.id != "1056952213056004118":
+        await ctx.respond("You aren't a bot owner 3:")
+        return
 
 @bot.slash_command(name="ai_tts", description="Joins VC and reads new AI replies out loud (doesnt work with the User App)") # please work istg
 @discord.option("voice", description="Which voice to read replies in", choices=list(TTS_VOICES), required=False, default=TTS_DEFAULT_VOICE)
