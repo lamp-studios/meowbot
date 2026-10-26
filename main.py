@@ -146,6 +146,7 @@ CHAT_MODEL = "qwen3.5:4b"
 # time and gpu for a chat bot. only the bool False actually turns it OFF, the strings
 # 'low'/'medium'/'high' are effort levels and all of them still think first
 CHAT_THINK = False
+TOOL_ROUNDS_MAX = 3   # tool calls allowed in one reply before we make it answer with words
 
 # /definition's whole job is inventing fake definitions and pronunciations, which a stock
 # model hedges on or refuses, so that one command keeps the abliterated model
@@ -386,47 +387,56 @@ def soggy_lore_for(prompt):
 
 
 async def chat_with_tools(model, messages):
-    """ollama.chat, plus the second call needed when the model asks for a tool.
+    """ollama.chat, looping while the model keeps asking for a tool.
 
-    Returns (text, soggy_url). soggy_url is None unless the soggy tool actually ran.
+    Returns (text, soggy_urls). soggy_urls is every picture the tool actually fetched.
 
-    The tool goes out with every message, because keyword-gating it meant a follow-up like
-    "gimme more pics" arrived with no tool to call. So restraint is entirely down to the
+    The tool is declared on EVERY round, including the ones after a tool already ran. If it
+    isn't, the conversation ends up holding a tool call and a role:tool result that point at
+    a tool the request no longer declares, and the model can't call it again -- so a reply to
+    a picture asking for another one had nothing to call.
+
+    The tool goes out with every message too, because keyword-gating it meant a follow-up
+    like "gimme more pics" arrived with no tool at all. So restraint is entirely down to the
     docstring now -- if it starts sending cats unprompted, that text is the thing to tighten.
     """
-    tools = [soggy_cat_api_tool]
+    convo = list(messages)   # a copy, the caller's history must stay free of tool traffic
+    soggy_urls = []
 
+    for _ in range(TOOL_ROUNDS_MAX):
+        response = await asyncio.to_thread(
+            ollama.chat,
+            model=model,
+            messages=convo,
+            stream=False,
+            think=CHAT_THINK,
+            tools=[soggy_cat_api_tool],
+            options={"num_predict": OLLAMA_NUM_PREDICT},
+        )
+
+        # anything that isn't our tool is a made up name, ignore it
+        calls = [c for c in (response.message.tool_calls or [])
+                 if c.function.name == "soggy_cat_api_tool"]
+        if not calls:
+            return str(response.message.content), soggy_urls
+
+        convo.append(response.message)
+        for call in calls:
+            url = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
+            soggy_urls.append(url)
+            convo.append({'role': 'tool', 'tool_name': call.function.name, 'content': url})
+
+    # it just kept calling the tool, so take one more round with no tools offered, which
+    # leaves it nothing to do but write the reply
     response = await asyncio.to_thread(
         ollama.chat,
         model=model,
-        messages=messages,
-        stream=False,
-        think=CHAT_THINK,
-        tools=tools,
-        options={"num_predict": OLLAMA_NUM_PREDICT},
-    )
-
-    soggy_url = None
-    followup = list(messages) + [response.message]
-    for call in response.message.tool_calls or []:
-        if call.function.name != "soggy_cat_api_tool":
-            continue   # it invented a tool name, ignore it
-        soggy_url = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
-        followup.append({'role': 'tool', 'tool_name': call.function.name, 'content': soggy_url})
-
-    if soggy_url is None:
-        return str(response.message.content), None
-
-    # it only asked for the tool, it hasn't written a reply yet, so go round again
-    response = await asyncio.to_thread(
-        ollama.chat,
-        model=model,
-        messages=followup,
+        messages=convo,
         stream=False,
         think=CHAT_THINK,
         options={"num_predict": OLLAMA_NUM_PREDICT},
     )
-    return str(response.message.content), soggy_url
+    return str(response.message.content), soggy_urls
 
 def trim(history):
     if len(history) > MAX_TURNS + 1:
@@ -529,7 +539,7 @@ async def on_message(message: discord.Message):
     try:
         async with message.channel.typing():   # the '...is typing' dots instead of a loading message
             # one timeout for the whole thing, tool round trip included
-            text, soggy_url = await asyncio.wait_for(
+            text, soggy_urls = await asyncio.wait_for(
                 chat_with_tools(model, to_send),
                 timeout=OLLAMA_TIMEOUT,
             )
@@ -543,9 +553,16 @@ async def on_message(message: discord.Message):
 
     print(text)
 
-    # if it fetched a picture but didn't put the link in, add it so one actually shows up
-    if soggy_url and soggy_url not in text:
-        text = f"{text}\n{soggy_url}"
+    # if it fetched pictures but didn't put the links in, add them so they actually show up
+    for url in soggy_urls:
+        if url not in text:
+            text = f"{text}\n{url}"
+
+    # a turn that only called a tool comes back with empty content, and split_msg drops
+    # blank chunks, so chunks[0] would IndexError. only reachable if it both said nothing
+    # and fetched nothing
+    if not text.strip():
+        text = "uhh i got nothing, try again?"
 
     # speak it, if tts is on for this guild and we're actually in a vc
     if message.guild and message.guild.id in tts_enabled:
@@ -666,7 +683,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     to_send.append(history[-1])
     try:
         # one timeout for the whole thing, tool round trip included
-        text, soggy_url = await asyncio.wait_for(
+        text, soggy_urls = await asyncio.wait_for(
             chat_with_tools(model, to_send),
             timeout=OLLAMA_TIMEOUT,
         )
@@ -680,9 +697,16 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
 
     print(text)
 
-    # if it fetched a picture but didn't put the link in, add it so one actually shows up
-    if soggy_url and soggy_url not in text:
-        text = f"{text}\n{soggy_url}"
+    # if it fetched pictures but didn't put the links in, add them so they actually show up
+    for url in soggy_urls:
+        if url not in text:
+            text = f"{text}\n{url}"
+
+    # a turn that only called a tool comes back with empty content, and split_msg drops
+    # blank chunks, so chunks[0] would IndexError. only reachable if it both said nothing
+    # and fetched nothing
+    if not text.strip():
+        text = "uhh i got nothing, try again?"
 
     # speak it, if tts is on for this guild and we're actually in a vc
     if ctx.guild and ctx.guild.id in tts_enabled:
