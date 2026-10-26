@@ -59,7 +59,9 @@ def soggy_cat_api_tool():
     # reads, so the 'only when asked' part has to live up there, not under Returns:
     soggy_cat_api = "https://soggyapi.sillycat.cloud/img"
     r = requests.get(soggy_cat_api)
-    return r.json()["url"]
+    r2 = r.json()["url"]
+    r2 = str(r2).replace(" ", "%20")
+    return r2
     
 
 
