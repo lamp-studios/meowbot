@@ -123,8 +123,9 @@ CHAT_MODEL = "qwen3.5:4b"
 #VISION_MODEL = "gemma3:4b"   # not needed, qwen3.5 reads images itself
 
 # qwen3.5 is a hybrid thinking model and reasons before answering by default, which burns
-# time and gpu for a chat bot. False turns that off, or use 'low'/'medium'/'high' to dial it
-CHAT_THINK = 'low'
+# time and gpu for a chat bot. only the bool False actually turns it OFF, the strings
+# 'low'/'medium'/'high' are effort levels and all of them still think first
+CHAT_THINK = False
 
 # /definition's whole job is inventing fake definitions and pronunciations, which a stock
 # model hedges on or refuses, so that one command keeps the abliterated model
