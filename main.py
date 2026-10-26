@@ -102,7 +102,6 @@ Your job is to also make up definitions when you can't find a real definition, s
 histories = {} # chat history for previous messages
 MAX_TURNS = 10
 bot_msgs = {}  # our own message id -> the user id whose history it came from
-warm_task = None  # the keep_chat_warm() task, so reconnects don't start a second one
 BOT_MSG_MEMORY = 500  # how many of those ids to keep before forgetting the oldest
 
 # ---------- limits ----------
@@ -126,10 +125,6 @@ CHAT_MODEL = "qwen3.5:9b"
 # /definition's whole job is inventing fake definitions and pronunciations, which a stock
 # model hedges on or refuses, so that one command keeps the abliterated model
 DEFINITION_MODEL = "huihui_ai/qwen3-abliterated:8b"
-
-CHAT_WARM_EVERY = 30       # seconds between touching the chat model so /ask stays instant
-CHAT_KEEP_ALIVE = "5m"     # how long ollama holds it per touch, well over the interval so
-                           # a couple of failed touches in a row don't drop it
 
 # ---------- kokoro tts config ----------
 KOKORO_MODEL  = os.path.join(BASE_DIR, "kokoro-v1.0.onnx")
@@ -363,36 +358,12 @@ def remember_bot_msg(sent, user_id):
         bot_msgs.pop(next(iter(bot_msgs)))   # dicts keep insertion order, so this is the oldest
 
 
-async def keep_chat_warm():
-    """Touch the chat model on a timer so ollama never unloads it between messages.
-
-    Without this the first /ask after a quiet spell pays the whole model load, which on a
-    9b is several seconds of nothing happening.
-    """
-    await bot.wait_until_ready()
-    while True:
-        try:
-            # an empty messages list just loads the model, it doesn't generate anything
-            await asyncio.to_thread(
-                ollama.chat, model=CHAT_MODEL, messages=[], keep_alive=CHAT_KEEP_ALIVE
-            )
-        except Exception as e:
-            print(f"[ollama] couldn't keep {CHAT_MODEL} warm: {e}")
-        await asyncio.sleep(CHAT_WARM_EVERY)
-
-
 generatecommand = bot.create_group("generate", "Generative AI stuff")
 
 @bot.event
 async def on_ready():
     print(f"{bot.user}, {bot.user.id} is running")
     await start_logger(load_logged())
-
-    # on_ready fires again on every reconnect, so don't stack up warm-keepers
-    global warm_task
-    if warm_task is None or warm_task.done():
-        warm_task = bot.loop.create_task(keep_chat_warm())
-        print(f"[ollama] keeping {CHAT_MODEL} warm every {CHAT_WARM_EVERY}s")
     #await connect_nodes() # connect to the server
 
 @bot.listen()
