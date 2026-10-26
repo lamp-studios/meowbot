@@ -112,6 +112,7 @@ VIDEO_POLL_EVERY = 5      # seconds between asking openrouter if the video is do
 VIDEO_MAX_WAIT = 10 * 60  # give up waiting after this (interaction tokens die at 15min)
 HORDE_POLL_EVERY = 5      # seconds between asking ai horde how the queue is going
 HORDE_MAX_WAIT = 10 * 60  # the free queue can be brutal, but 15min is the hard ceiling
+FREE_GENS_PER_DAY = 8     # cloudflare gens per person per day before they're cut off
 
 # ---------- kokoro tts config ----------
 KOKORO_MODEL  = os.path.join(BASE_DIR, "kokoro-v1.0.onnx")
@@ -814,6 +815,12 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
         }
         payload = {
             "prompt": prompt,
+            # it's "models", plural: horde silently ignores "model" and gives you a random
+            # one. any worker serving ANY of these can take the job, so listing a few cuts
+            # the wait without settling for a worse model. all three are native 1024x1024
+            # like the params below ask for (Deliberate and co are sd1.5, they duplicate
+            # faces and limbs at that size)
+            "models": ["AlbedoBase XL (SDXL)", "SDXL 1.0", "Juggernaut XL"],
             "params": {
                 "sampler_name": "k_euler_a",
                 "cfg_scale": 7.5,
@@ -841,6 +848,13 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                 job_id = result.get("id")
                 if resp.status not in (200, 202) or not job_id:
                     return await msg.edit(content=f"AI Horde said nah: {result.get('message', result)}")
+
+            # asking for models nobody serves isn't an error, the job just sits there until it
+            # expires, so bail now instead of polling all the way to the deadline
+            if any(w.get("code") == "NoAvailableWorker" for w in result.get("warnings") or []):
+                async with session.delete(f"https://aihorde.net/api/v2/generate/status/{job_id}", headers=headers):
+                    pass   # don't leave junk sitting in a shared queue
+                return await msg.edit(content="No AI Horde worker is serving those models right now. Try another provider.")
 
             print(f"[horde] job {job_id} submitted by {ctx.author.id}")
 
@@ -901,8 +915,8 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
             user["count"] = 0
 
         if ctx.author.id != 1056952213056004118:
-            if user["count"] >= 5 + user["bonus"]:
-                return await msg.edit(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!")        
+            if user["count"] >= FREE_GENS_PER_DAY + user["bonus"]:
+                return await msg.edit(content=f"You are currently limited! You only have {FREE_GENS_PER_DAY} generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each $1 is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://comfy.org/download>)!")        
         form = aiohttp.FormData()
         form.add_field("prompt", prompt)
         form.add_field("width", "512")
@@ -1097,7 +1111,7 @@ async def debugging(ctx: discord.ApplicationContext):
         lines.append(f"guild {gid}: {q.qsize()} lines queued")
 
     await ctx.respond("Debugging:\n" + "\n".join(lines), ephemeral=True)
-    await ctx.send(content="You are currently limited! You only have 5 generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each 1€ is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://ollama.com/x/flux2-klein>)!\n")
+    await ctx.send(content=f"You are currently limited! You only have {FREE_GENS_PER_DAY} generations a day! [Donate](https://ko-fi.com/lampyt) to get access to more generations per day! Each 1€ is 3 extra generations per day.\nIf you do not want to donate, thats fine! You can still enjoy other providers for the time being, if you'd like, or [host your own](<https://comfy.org/download>)!\n")
 
 """@bot.slash_command(name="play_song", description="Play a song from YouTube.")
 async def play(ctx: discord.ApplicationContext, search: str):
