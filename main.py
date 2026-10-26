@@ -46,15 +46,17 @@ bot = discord.Bot(
 # TODO: Add mention-for-reply feature
 
 def soggy_cat_api_tool():
-    """Gets a random Soggy cat picture from the Soggy API
-    
-    Returns:
-    A filename and URL
+    """Returns the URL of a random Soggy cat (Caesar) photo.
+
+    Only call this when the user explicitly asks to SEE a soggy cat picture.
+    Do not call it to talk about soggy cat, answer questions about him, or
+    decorate an unrelated reply.
     """
+    # everything above the Args:/Returns: heading becomes the tool description the model
+    # reads, so the 'only when asked' part has to live up there, not under Returns:
     soggy_cat_api = "https://soggyapi.sillycat.cloud/img"
     r = requests.get(soggy_cat_api)
-    img = r.json()["url"]
-    #print(img)
+    return r.json()["url"]
     
 
 
@@ -100,6 +102,7 @@ Your job is to also make up definitions when you can't find a real definition, s
 histories = {} # chat history for previous messages
 MAX_TURNS = 10
 bot_msgs = {}  # our own message id -> the user id whose history it came from
+warm_task = None  # the keep_chat_warm() task, so reconnects don't start a second one
 BOT_MSG_MEMORY = 500  # how many of those ids to keep before forgetting the oldest
 
 # ---------- limits ----------
@@ -113,6 +116,20 @@ VIDEO_MAX_WAIT = 10 * 60  # give up waiting after this (interaction tokens die a
 HORDE_POLL_EVERY = 5      # seconds between asking ai horde how the queue is going
 HORDE_MAX_WAIT = 10 * 60  # the free queue can be brutal, but 15min is the hard ceiling
 FREE_GENS_PER_DAY = 8     # cloudflare gens per person per day before they're cut off
+
+# ---------- models ----------
+# qwen3.5 is multimodal and does tool calling, so one model covers text and images
+CHAT_MODEL = "qwen3.5:9b"
+#CHAT_MODEL = "llama3.1:8b"   # good, uncomment if you want llama back
+#VISION_MODEL = "gemma3:4b"   # not needed, qwen3.5 reads images itself
+
+# /definition's whole job is inventing fake definitions and pronunciations, which a stock
+# model hedges on or refuses, so that one command keeps the abliterated model
+DEFINITION_MODEL = "huihui_ai/qwen3-abliterated:8b"
+
+CHAT_WARM_EVERY = 30       # seconds between touching the chat model so /ask stays instant
+CHAT_KEEP_ALIVE = "5m"     # how long ollama holds it per touch, well over the interval so
+                           # a couple of failed touches in a row don't drop it
 
 # ---------- kokoro tts config ----------
 KOKORO_MODEL  = os.path.join(BASE_DIR, "kokoro-v1.0.onnx")
@@ -346,12 +363,36 @@ def remember_bot_msg(sent, user_id):
         bot_msgs.pop(next(iter(bot_msgs)))   # dicts keep insertion order, so this is the oldest
 
 
+async def keep_chat_warm():
+    """Touch the chat model on a timer so ollama never unloads it between messages.
+
+    Without this the first /ask after a quiet spell pays the whole model load, which on a
+    9b is several seconds of nothing happening.
+    """
+    await bot.wait_until_ready()
+    while True:
+        try:
+            # an empty messages list just loads the model, it doesn't generate anything
+            await asyncio.to_thread(
+                ollama.chat, model=CHAT_MODEL, messages=[], keep_alive=CHAT_KEEP_ALIVE
+            )
+        except Exception as e:
+            print(f"[ollama] couldn't keep {CHAT_MODEL} warm: {e}")
+        await asyncio.sleep(CHAT_WARM_EVERY)
+
+
 generatecommand = bot.create_group("generate", "Generative AI stuff")
 
 @bot.event
 async def on_ready():
     print(f"{bot.user}, {bot.user.id} is running")
     await start_logger(load_logged())
+
+    # on_ready fires again on every reconnect, so don't stack up warm-keepers
+    global warm_task
+    if warm_task is None or warm_task.done():
+        warm_task = bot.loop.create_task(keep_chat_warm())
+        print(f"[ollama] keeping {CHAT_MODEL} warm every {CHAT_WARM_EVERY}s")
     #await connect_nodes() # connect to the server
 
 @bot.listen()
@@ -414,13 +455,13 @@ async def on_message(message: discord.Message):
     user_msg = {'role': 'user', 'content': f"<@{message.author.id}>: {prompt}"}
 
     image = next((a for a in message.attachments if (a.content_type or "").startswith("image/")), None)
+    model = CHAT_MODEL
+
     if image:
         image_bytes = await image.read()
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         user_msg['images'] = [image_data]
-        model = 'gemma3:4b' # pain
-    else:
-        model = 'huihui_ai/qwen3-abliterated:8b'
+        #model = 'gemma3:4b' # pain, no longer needed, CHAT_MODEL handles images
 
     history.append(user_msg)
 
@@ -554,14 +595,13 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
 
     user_msg = {'role': 'user', 'content': f"<@{ctx.author.id}>: {prompt}"}
 
+    model = CHAT_MODEL
+
     if image:
         image_bytes = await image.read()
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         user_msg['images'] = [image_data]
-        model = 'gemma3:4b' # pain
-    else:
-        #model = 'llama3.1:8b' # good, testing qwen for now, uncomment if you want llama
-        model = 'huihui_ai/qwen3-abliterated:8b'
+        #model = 'gemma3:4b' # pain, no longer needed, CHAT_MODEL handles images
 
     history.append(user_msg)
 
@@ -626,7 +666,7 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
         loading_emoji = "<a:loading2:1545851854821396500>"  # guild emoji
 
     msg = await ctx.respond(f"{loading_emoji}\nThe AI is generating, please wait...")
-    model = 'huihui_ai/qwen3-abliterated:8b'
+    model = DEFINITION_MODEL
     user_msg = [{'role': 'system', 'content': DEFINITION_SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
     try:
         response = await asyncio.wait_for(

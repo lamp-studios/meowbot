@@ -62,7 +62,7 @@ fi
 if command -v ollama >/dev/null 2>&1; then
     sudo systemctl enable --now ollama >/dev/null 2>&1 || true
     ok "ollama running, pulling models (this can take a while the first time)"
-    for m in llama3.1:8b gemma3:4b; do ollama pull "$m" || warn "failed to pull $m"; done
+    for m in qwen3.5:9b huihui_ai/qwen3-abliterated:8b; do ollama pull "$m" || warn "failed to pull $m"; done
 fi
 
 # 5. sanity checks

@@ -33,7 +33,8 @@ you can change all of these at the top of `main.py`
 ## what you need
 - python 3.13 (uv grabs it for you if you don't have it)
 - [uv](https://docs.astral.sh/uv/)
-- [ollama](https://ollama.com) with `llama3.1:8b` and `gemma3:4b` pulled
+- [ollama](https://ollama.com) with `qwen3.5:9b` pulled (it does text and image recognition in one)
+  and `huihui_ai/qwen3-abliterated:8b`, which only `/definition` uses so it'll happily make stuff up
 - ffmpeg (for tts)
 - nothing for tts, the kokoro model files (`kokoro-v1.0.onnx` and `voices-v1.0.bin`, ~350MB total) download themselves on first run if they aren't next to `main.py` already
 - a `.env` file next to `main.py` with your bot token in it:
