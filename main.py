@@ -48,9 +48,12 @@ bot = discord.Bot(
 def soggy_cat_api_tool():
     """Returns the URL of a random Soggy cat (Caesar) photo.
 
-    Only call this when the user explicitly asks to SEE a soggy cat picture.
-    Do not call it to talk about soggy cat, answer questions about him, or
-    decorate an unrelated reply.
+    Call this ONLY when the user is asking to see a picture right now. That includes
+    follow-ups that don't name him, like "another one", "more pics", "again", "one more".
+
+    Do NOT call it otherwise. Not to greet someone, not to talk about soggy cat, not to
+    answer a question about him, not to decorate a reply about something else. If the
+    user did not ask for a picture, just reply with words and no tool call.
     """
     # everything above the Args:/Returns: heading becomes the tool description the model
     # reads, so the 'only when asked' part has to live up there, not under Returns:
@@ -113,6 +116,10 @@ SOGGY_WORDS = ("soggy", "caesar", "sillyfuny", "biscuit", "wet cat")
 histories = {} # chat history for previous messages
 MAX_TURNS = 10
 bot_msgs = {}  # our own message id -> the user id whose history it came from
+horde_jobs = {}       # user id -> the horde job they currently have in flight
+horde_cancelled = set()  # job ids someone ran /stop_job on. cancelling server side isn't
+                         # enough: /check keeps reporting the job as waiting afterwards,
+                         # so the poll loop has to watch this instead
 BOT_MSG_MEMORY = 500  # how many of those ids to keep before forgetting the oldest
 
 # ---------- limits ----------
@@ -376,16 +383,16 @@ def soggy_lore_for(prompt):
     return []
 
 
-async def chat_with_tools(model, messages, prompt):
+async def chat_with_tools(model, messages):
     """ollama.chat, plus the second call needed when the model asks for a tool.
 
     Returns (text, soggy_url). soggy_url is None unless the soggy tool actually ran.
 
-    The tool is only even OFFERED when the user mentioned soggy cat: a tool that isn't in
-    the request can't be called, which is the only hard guarantee there is. The docstring
-    saying 'only when they ask to see a picture' is the soft second layer.
+    The tool goes out with every message, because keyword-gating it meant a follow-up like
+    "gimme more pics" arrived with no tool to call. So restraint is entirely down to the
+    docstring now -- if it starts sending cats unprompted, that text is the thing to tighten.
     """
-    tools = [soggy_cat_api_tool] if wants_soggy(prompt) else None
+    tools = [soggy_cat_api_tool]
 
     response = await asyncio.to_thread(
         ollama.chat,
@@ -521,7 +528,7 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():   # the '...is typing' dots instead of a loading message
             # one timeout for the whole thing, tool round trip included
             text, soggy_url = await asyncio.wait_for(
-                chat_with_tools(model, to_send, prompt),
+                chat_with_tools(model, to_send),
                 timeout=OLLAMA_TIMEOUT,
             )
     except asyncio.TimeoutError:
@@ -658,7 +665,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     try:
         # one timeout for the whole thing, tool round trip included
         text, soggy_url = await asyncio.wait_for(
-            chat_with_tools(model, to_send, prompt),
+            chat_with_tools(model, to_send),
             timeout=OLLAMA_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -943,48 +950,57 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
 
             started = time.time()
             deadline = started + HORDE_MAX_WAIT
+            horde_jobs[ctx.author.id] = job_id   # so /stop_job knows what to kill
 
-            while True:
-                if time.time() > deadline:
-                    return await msg.edit(content=f"AI Horde took over {HORDE_MAX_WAIT // 60} minutes so I gave up. The free queue is like that, try again or pick another provider.")
+            try:
+                while True:
+                    if job_id in horde_cancelled:
+                        return await msg.edit(content="Stopped that generation.")
 
-                await asyncio.sleep(HORDE_POLL_EVERY)
+                    if time.time() > deadline:
+                        return await msg.edit(content=f"AI Horde took over {HORDE_MAX_WAIT // 60} minutes so I gave up. The free queue is like that, try again or pick another provider.")
 
-                async with session.get(f"https://aihorde.net/api/v2/generate/check/{job_id}", headers=headers) as resp:
-                    check = await resp.json()
+                    await asyncio.sleep(HORDE_POLL_EVERY)
 
-                if check.get("faulted"):
-                    return await msg.edit(content="The AI Horde workers faulted on that one, try again.")
-                if not check.get("is_possible", True):
-                    return await msg.edit(content="No AI Horde worker online can handle that request. Try another provider.")
-                if check.get("done"):
-                    break
+                    async with session.get(f"https://aihorde.net/api/v2/generate/check/{job_id}", headers=headers) as resp:
+                        check = await resp.json()
 
-                # edit every poll so a long queue still looks alive. horde's wait_time can sit
-                # on the same number for a while, so show our own elapsed count too
-                waited = int(time.time() - started)
-                line = f"queue #{check.get('queue_position', '?')}, ~{check.get('wait_time', '?')}s left, waited {waited}s"
-                await msg.edit(content=f"{loading_emoji}\nThe image is being generated, please wait... ({line})")
+                    if check.get("faulted"):
+                        return await msg.edit(content="The AI Horde workers faulted on that one, try again.")
+                    if not check.get("is_possible", True):
+                        return await msg.edit(content="No AI Horde worker online can handle that request. Try another provider.")
+                    if check.get("done"):
+                        break
 
-            async with session.get(f"https://aihorde.net/api/v2/generate/status/{job_id}", headers=headers) as resp:
-                status_data = await resp.json()
+                    # edit every poll so a long queue still looks alive. horde's wait_time can
+                    # sit on the same number for a while, so show our own elapsed count too
+                    waited = int(time.time() - started)
+                    line = f"queue #{check.get('queue_position', '?')}, ~{check.get('wait_time', '?')}s left, waited {waited}s"
+                    await msg.edit(content=f"{loading_emoji}\nThe image is being generated, please wait... ({line}). /stop_job to cancel.")
 
-            gens = status_data.get("generations") or []
-            img = gens[0].get("img") if gens else None
-            if not img:
-                return await msg.edit(content="AI Horde says it finished but sent no image, uhh")
+                async with session.get(f"https://aihorde.net/api/v2/generate/status/{job_id}", headers=headers) as resp:
+                    status_data = await resp.json()
 
-            # r2 gives a url, no r2 gives base64
-            if img.startswith("http"):
-                ext = img.split("?")[0].rsplit(".", 1)[-1].lower()
-                if ext not in ("png", "jpg", "jpeg", "webp"):
-                    ext = "webp"
-                async with session.get(img) as resp:
-                    if resp.status != 200:
-                        return await msg.edit(content=f"Couldn't download the image, here's the url instead:\n{img}")
-                    data = await resp.read()
-            else:
-                data = base64.b64decode(img)
+                gens = status_data.get("generations") or []
+                img = gens[0].get("img") if gens else None
+                if not img:
+                    return await msg.edit(content="AI Horde says it finished but sent no image, uhh")
+
+                # r2 gives a url, no r2 gives base64
+                if img.startswith("http"):
+                    ext = img.split("?")[0].rsplit(".", 1)[-1].lower()
+                    if ext not in ("png", "jpg", "jpeg", "webp"):
+                        ext = "webp"
+                    async with session.get(img) as resp:
+                        if resp.status != 200:
+                            return await msg.edit(content=f"Couldn't download the image, here's the url instead:\n{img}")
+                        data = await resp.read()
+                else:
+                    data = base64.b64decode(img)
+            finally:
+                # every exit path comes through here, including the returns above
+                horde_jobs.pop(ctx.author.id, None)
+                horde_cancelled.discard(job_id)
 
     if provider == "Cloudflare Workers AI (Free but limited)":
         today = datetime.date.today().isoformat()
@@ -1126,6 +1142,34 @@ async def video(ctx: discord.ApplicationContext, prompt: str, provider: str):
 
     file = discord.File(io.BytesIO(data), filename=f"{random.randint(100,100000000000)}_generated.mp4")
     await msg.edit(content="The video has finished generating!", file=file)
+@bot.slash_command(name="stop_job", description="Cancel the AI Horde image you have generating.")
+async def stop_job(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+
+    job_id = horde_jobs.get(ctx.author.id)
+    if not job_id:
+        return await ctx.respond("You don't have an AI Horde image generating right now.", ephemeral=True)
+
+    # tell the poll loop first: /check still reports a cancelled job as waiting, so the
+    # delete alone would leave it spinning until the deadline
+    horde_cancelled.add(job_id)
+
+    horde_key = os.getenv("AIHORDE_API_KEY") or "0000000000"
+    headers = {
+        "apikey": horde_key,
+        "Client-Agent": "MeowBot:1.0:lampyt",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(f"https://aihorde.net/api/v2/generate/status/{job_id}", headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"[horde] cancel of {job_id} returned {resp.status}")
+    except Exception as e:
+        print(f"[horde] couldn't cancel {job_id}: {e}")   # the loop still stops either way
+
+    print(f"[horde] job {job_id} cancelled by {ctx.author.id}")
+    await ctx.respond("Told AI Horde to drop that job.", ephemeral=True)
+
 @bot.slash_command(name="ai_tts_stop", description="Stop reading replies out loud and leave the VC.")
 async def ai_tts_stop(ctx: discord.ApplicationContext):
     await ctx.defer()
