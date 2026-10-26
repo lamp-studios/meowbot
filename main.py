@@ -858,8 +858,8 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
 
             print(f"[horde] job {job_id} submitted by {ctx.author.id}")
 
-            deadline = time.time() + HORDE_MAX_WAIT
-            last_line = None
+            started = time.time()
+            deadline = started + HORDE_MAX_WAIT
 
             while True:
                 if time.time() > deadline:
@@ -877,11 +877,11 @@ async def image(ctx: discord.ApplicationContext, prompt: str, provider: str):
                 if check.get("done"):
                     break
 
-                # queue position is the only thing worth showing, and only when it moves
-                line = f"queue #{check.get('queue_position', '?')}, ~{check.get('wait_time', '?')}s left"
-                if line != last_line:
-                    last_line = line
-                    await msg.edit(content=f"{loading_emoji}\nThe image is being generated, please wait... ({line})")
+                # edit every poll so a long queue still looks alive. horde's wait_time can sit
+                # on the same number for a while, so show our own elapsed count too
+                waited = int(time.time() - started)
+                line = f"queue #{check.get('queue_position', '?')}, ~{check.get('wait_time', '?')}s left, waited {waited}s"
+                await msg.edit(content=f"{loading_emoji}\nThe image is being generated, please wait... ({line})")
 
             async with session.get(f"https://aihorde.net/api/v2/generate/status/{job_id}", headers=headers) as resp:
                 status_data = await resp.json()
