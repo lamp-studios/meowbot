@@ -455,6 +455,10 @@ def channel_context_for(channel_id):
     return [{'role': 'system',
              'content': "Recent conversation in this channel, for context:\n" + "\n".join(lines)}]
 
+def is_bot_owner(user):
+    """owner_id is already set on the Bot above, so that stays the one place to change it."""
+    return user.id == bot.owner_id
+
 def soggy_lore_for(prompt):
     """The soggy cat backstory as an extra system message, but only if they asked.
 
@@ -597,7 +601,7 @@ async def on_message(message: discord.Message):
     if not prompt:
         return await message.reply("you didnt say anything lil bro")
 
-    if len(prompt) > MAX_PROMPT_CHARS:
+    if len(prompt) > MAX_PROMPT_CHARS and not is_bot_owner(message.author):
         return await message.reply(
             f"that prompt is {len(prompt)} characters, keep it under {MAX_PROMPT_CHARS} lil bro"
         )
@@ -857,7 +861,7 @@ async def opt_in(ctx: discord.ApplicationContext):
 async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attachment = None):
     await ctx.defer()
 
-    if len(prompt) > MAX_PROMPT_CHARS:
+    if len(prompt) > MAX_PROMPT_CHARS and not is_bot_owner(ctx.author):
         return await ctx.respond(
             f"that prompt is {len(prompt)} characters, keep it under {MAX_PROMPT_CHARS} lil bro"
         )
@@ -953,7 +957,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
 @discord.option("prompt", type=discord.SlashCommandOptionType.string, required=True)
 async def definition(ctx: discord.ApplicationContext, prompt: str):
     await ctx.defer()
-    if len(prompt) > MAX_PROMPT_CHARS:
+    if len(prompt) > MAX_PROMPT_CHARS and not is_bot_owner(ctx.author):
         return await ctx.respond(
             f"that prompt is {len(prompt)} characters, keep it under {MAX_PROMPT_CHARS} lil bro"
         )
@@ -999,9 +1003,17 @@ async def reset(ctx: discord.ApplicationContext):
 
 @bot.slash_command(name="change_model", description="Change the model.")
 async def change_model(ctx: discord.ApplicationContext):
-    if ctx.author.id != "1056952213056004118":
-        await ctx.respond("You aren't a bot owner 3:")
-        return
+    if not is_bot_owner(ctx.author):
+        return await ctx.respond("You aren't a bot owner 3:", ephemeral=True)
+
+    # TODO: actually switch it. for now just report what's loaded, so the command at least
+    # answers instead of leaving the interaction hanging
+    await ctx.respond(
+        f"chat: `{CHAT_MODEL}` (think={CHAT_THINK})\n"
+        f"definition: `{DEFINITION_MODEL}`\n"
+        f"switching isn't wired up yet, edit CHAT_MODEL at the top of main.py",
+        ephemeral=True,
+    )
 
 @bot.slash_command(name="ai_tts", description="Joins VC and reads new AI replies out loud (doesnt work with the User App)") # please work istg
 @discord.option("voice", description="Which voice to read replies in", choices=list(TTS_VOICES), required=False, default=TTS_DEFAULT_VOICE)
@@ -1476,7 +1488,7 @@ async def debugging(ctx: discord.ApplicationContext):
         f"tts voices: {', '.join(TTS_VOICES)} @ {TTS_SPEED}x (default {TTS_DEFAULT_VOICE})",
         f"per-guild voice: {tts_voices or 'none set'}",
         f"tts enabled in guilds: {sorted(tts_enabled)}",
-        f"limits: prompt {MAX_PROMPT_CHARS} chars / {OLLAMA_NUM_PREDICT} tokens / {OLLAMA_TIMEOUT}s",
+        f"limits: prompt {MAX_PROMPT_CHARS} chars (owner exempt) / {OLLAMA_NUM_PREDICT} tokens / {OLLAMA_TIMEOUT}s",
     ]
     for gid, q in tts_queues.items():
         lines.append(f"guild {gid}: {q.qsize()} lines queued")
