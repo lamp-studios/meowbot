@@ -87,6 +87,7 @@ async def web_search_tool(query: str):
     headers = {
         "Authorization": f"Bearer {OLLAMA_API_KEY}",
         "Content-Type": "application/json",
+        "User-Agent": "MeowBot/1.0 (discord bot)",   # the default aiohttp UA trips some filters
     }
     payload = {"query": query, "max_results": WEB_SEARCH_RESULTS}
 
@@ -94,11 +95,24 @@ async def web_search_tool(query: str):
         timeout = aiohttp.ClientTimeout(total=WEB_SEARCH_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(WEB_SEARCH_URL, headers=headers, json=payload) as resp:
-                if resp.status != 200:
-                    body = (await resp.text())[:200]
-                    print(f"[search] {resp.status}: {body}")
-                    return f"the search failed ({resp.status})"
-                data = await resp.json()
+                # read it as text first: resp.json() throws away the body on a mimetype
+                # mismatch, which hid a 200 that was actually an html interstitial
+                raw = await resp.text()
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "?")
+                final = str(resp.url)
+                hops = len(resp.history)
+
+        if status != 200:
+            print(f"[search] {status} {ctype}: {raw[:300]}")
+            return f"the search failed ({status})"
+
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            print(f"[search] 200 but not json. ctype={ctype} url={final} redirects={hops}")
+            print(f"[search] body: {raw[:500]}")
+            return "the search endpoint returned a web page instead of results"
     except Exception as e:
         print(f"[search] {type(e).__name__}: {e}")
         return "the search failed, couldn't reach it"
@@ -195,6 +209,11 @@ characters.
 MAX_PROMPT_CHARS = 730    # reject absurd prompts before they reach ollama
 OLLAMA_NUM_PREDICT = 2000  # shared by the thinking AND the reply. at 800 the reasoning
                            # ate the whole budget and content came back empty
+OLLAMA_NUM_CTX = 8192      # how much prompt the model can SEE, separate from num_predict.
+                           # system prompt + channel context + history + search results runs
+                           # to ~2700 tokens, and ollama's default is often 4096, which
+                           # silently truncates. the web search docs suggest ~32000 but that
+                           # costs vram, and the snippet caps keep results small
 OLLAMA_TIMEOUT = 200       # seconds before we give up on a generation
 SYNTH_TIMEOUT = 50        # seconds before we give up on one tts clip
 TTS_QUEUE_MAX = 5         # drop new lines once this many are already waiting
@@ -558,7 +577,7 @@ async def ollama_chat(model, messages, tools=None, think=None):
         "messages": messages,
         "stream": False,
         "think": CHAT_THINK if think is None else think,
-        "options": {"num_predict": OLLAMA_NUM_PREDICT},
+        "options": {"num_predict": OLLAMA_NUM_PREDICT, "num_ctx": OLLAMA_NUM_CTX},
     }
     if tools:
         payload["tools"] = tools
@@ -1576,7 +1595,7 @@ async def debugging(ctx: discord.ApplicationContext):
         f"tts voices: {', '.join(TTS_VOICES)} @ {TTS_SPEED}x (default {TTS_DEFAULT_VOICE})",
         f"per-guild voice: {tts_voices or 'none set'}",
         f"tts enabled in guilds: {sorted(tts_enabled)}",
-        f"limits: prompt {MAX_PROMPT_CHARS} chars (owner exempt) / {OLLAMA_NUM_PREDICT} tokens / {OLLAMA_TIMEOUT}s",
+        f"limits: prompt {MAX_PROMPT_CHARS} chars (owner exempt) / {OLLAMA_NUM_PREDICT} out / {OLLAMA_NUM_CTX} ctx / {OLLAMA_TIMEOUT}s",
     ]
     for gid, q in tts_queues.items():
         lines.append(f"guild {gid}: {q.qsize()} lines queued")
