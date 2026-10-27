@@ -64,6 +64,58 @@ def soggy_cat_api_tool():
     r2 = str(r2).replace(" ", "%20")
     return r2
 
+def web_search(query):
+    if not query:
+        return
+
+    reply = requests.post("https://ollama.com/api/web_search", data=f'{"query": str(query)}')
+
+async def web_search_tool(query: str):
+    """Searches the web and returns the top results, each with a title, url and snippet.
+
+    Use this when the answer depends on something you can't already know: news, prices,
+    scores, releases, who currently holds some position, or anything that changed recently.
+    Put in the query what you would type into a search box.
+
+    If you already know the answer, answer it instead of searching.
+    """
+    # the docstring above is what the model reads, keep it mostly about when to use it.
+    # note this is ollama's CLOUD service, not the local server: different host, needs a key
+    if not OLLAMA_API_KEY:
+        return "web search isn't set up (no OLLAMA_API_KEY)"
+
+    headers = {
+        "Authorization": f"Bearer {OLLAMA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"query": query, "max_results": WEB_SEARCH_RESULTS}
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=WEB_SEARCH_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(WEB_SEARCH_URL, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:200]
+                    print(f"[search] {resp.status}: {body}")
+                    return f"the search failed ({resp.status})"
+                data = await resp.json()
+    except Exception as e:
+        print(f"[search] {type(e).__name__}: {e}")
+        return "the search failed, couldn't reach it"
+
+    results = data.get("results") or []
+    if not results:
+        return f"no results for {query!r}"
+
+    print(f"[search] {query!r} -> {len(results)} result(s)")
+
+    # snippets can be enormous, and all of this goes into the next prompt
+    chunks = []
+    for r in results[:WEB_SEARCH_RESULTS]:
+        snippet = str(r.get("content") or "")[:WEB_SEARCH_SNIPPET_CHARS]
+        chunks.append(f"{r.get('title')}\n{r.get('url')}\n{snippet}")
+    return ("\n\n").join(chunks)
+
 
 async def connect_nodes():
     """Connect to our Lavalink nodes."""
@@ -152,6 +204,15 @@ HORDE_POLL_EVERY = 5      # seconds between asking ai horde how the queue is goi
 HORDE_MAX_WAIT = 10 * 60  # the free queue can be brutal, but 15min is the hard ceiling
 FREE_GENS_PER_DAY = 8     # cloudflare gens per person per day before they're cut off
 
+# ---------- web search (ollama cloud, NOT the local server) ----------
+# needs a free key from ollama.com/settings/keys in .env as OLLAMA_API_KEY. without it the
+# tool simply isn't offered to the model
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+WEB_SEARCH_URL = "https://ollama.com/api/web_search"
+WEB_SEARCH_RESULTS = 3        # results handed to the model (the api allows up to 10)
+WEB_SEARCH_SNIPPET_CHARS = 800  # per result, snippets can be huge and this all becomes prompt
+WEB_SEARCH_TIMEOUT = 20       # seconds, so a hung search doesn't eat the whole reply budget
+
 # ---------- ollama ----------
 # we talk to the http api directly rather than through the sync client, see ollama_chat()
 OLLAMA_HOST = os.getenv("OLLAMA_HOST") or "127.0.0.1:11434"
@@ -166,6 +227,21 @@ SOGGY_TOOL_SCHEMA = {
         "name": soggy_cat_api_tool.__name__,
         "description": inspect.getdoc(soggy_cat_api_tool),
         "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+WEB_SEARCH_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": web_search_tool.__name__,
+        "description": inspect.getdoc(web_search_tool),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "what to search for"},
+            },
+            "required": ["query"],
+        },
     },
 }
 
@@ -507,31 +583,43 @@ async def chat_with_tools(model, messages):
     a tool the request no longer declares, and the model can't call it again -- so a reply to
     a picture asking for another one had nothing to call.
 
-    The tool goes out with every message too, because keyword-gating it meant a follow-up
-    like "gimme more pics" arrived with no tool at all. So restraint is entirely down to the
-    docstring now -- if it starts sending cats unprompted, that text is the thing to tighten.
+    The tools go out with every message too, because keyword-gating the cat one meant a
+    follow-up like "gimme more pics" arrived with no tool at all. So restraint is entirely
+    down to the docstrings -- if it starts searching or sending cats unprompted, that text
+    is the thing to tighten.
     """
     convo = list(messages)   # a copy, the caller's history must stay free of tool traffic
     soggy_urls = []
     tools_used = []
 
-    for _ in range(TOOL_ROUNDS_MAX):
-        msg = await ollama_chat(model, convo, tools=[SOGGY_TOOL_SCHEMA])
+    tools = [SOGGY_TOOL_SCHEMA]
+    if OLLAMA_API_KEY:   # no key, no search tool, rather than offering one that always fails
+        tools.append(WEB_SEARCH_TOOL_SCHEMA)
+    known = {t["function"]["name"] for t in tools}
 
-        # anything that isn't our tool is a made up name, ignore it
+    for _ in range(TOOL_ROUNDS_MAX):
+        msg = await ollama_chat(model, convo, tools=tools)
+
+        # anything not in `known` is a name it made up, ignore it
         calls = [c for c in (msg.get("tool_calls") or [])
-                 if (c.get("function") or {}).get("name") == "soggy_cat_api_tool"]
+                 if (c.get("function") or {}).get("name") in known]
         if not calls:
             return str(msg.get("content") or ""), soggy_urls, tools_used
 
         convo.append(msg)
         for call in calls:
             name = call["function"]["name"]
-            url = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
-            soggy_urls.append(url)
+            args = call["function"].get("arguments") or {}
+
+            if name == "web_search_tool":
+                result = await web_search_tool(str(args.get("query") or ""))
+            else:
+                result = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
+                soggy_urls.append(result)
+
             if name not in tools_used:
                 tools_used.append(name)
-            convo.append({'role': 'tool', 'tool_name': name, 'content': url})
+            convo.append({'role': 'tool', 'tool_name': name, 'content': result})
 
     # it just kept calling the tool, so take one more round with no tools offered, which
     # leaves it nothing to do but write the reply
