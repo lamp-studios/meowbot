@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import threading
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError   # windows needs the tzdata package
@@ -249,6 +250,130 @@ async def ddg_results(query, region="us-en"):
     return None, last_status
 
 
+def searxng_url():
+    # read per call: main.py imports this module before it loads .env
+    return (os.getenv("SEARXNG_URL") or "").rstrip("/")
+
+
+SEARCH_CACHE_TTL = 10 * 60      # same query within 10 minutes reuses the results
+SEARCH_CACHE_MAX = 200
+DDG_COOLDOWN = 2 * 60           # after ddg 202s, leave it alone this long
+_search_cache = {}              # (query, region) -> (time, results, source)
+_ddg_blocked_until = 0.0
+
+
+async def searxng_results(query, region="us-en"):
+    """Results from your own SearXNG instance. It's configured by you, often on localhost
+    or the LAN, so this deliberately skips the public-only resolver. Its settings.yml needs
+    json in search.formats, or every request comes back 403."""
+    lang = region.split("-")[-1] if "-" in region else "en"
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout, headers=SEARCH_HEADERS) as session:
+        async with session.get(f"{searxng_url()}/search",
+                               params={"q": query, "format": "json", "language": lang}) as resp:
+            if resp.status != 200:
+                print(f"[search] searxng -> {resp.status}"
+                      + (" (is json enabled in its settings.yml?)" if resp.status == 403 else ""))
+                return None
+            data = await resp.json(content_type=None)
+    return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content") or ""}
+            for r in data.get("results") or [] if r.get("url")]
+
+
+def _ddgs_text(query, region):
+    from ddgs import DDGS   # imported here so a broken ddgs install can't stop the bot starting
+    rows = DDGS(timeout=HTTP_TIMEOUT).text(query, region=region, safesearch="moderate",
+                                           max_results=WEB_SEARCH_RESULTS * 2)
+    return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body") or ""}
+            for r in rows or [] if r.get("href")]
+
+
+async def ddgs_results(query, region="us-en"):
+    """The ddgs package: an unofficial metasearch scraper that rotates through several
+    engines (bing, brave, google, mojeek, yandex...) on its own, so one engine blocking us
+    doesn't end the search. It's synchronous, so it runs in a thread."""
+    try:
+        return await asyncio.to_thread(_ddgs_text, query, region)
+    except Exception as e:
+        # its rate limit exception isn't reliably raised, so everything is just "failed"
+        print(f"[search] ddgs {type(e).__name__}: {e}")
+        return None
+
+
+async def ddg_instant_results(query):
+    """DuckDuckGo's instant answer api: a separate endpoint from the html search, so it
+    usually still works while that one is rate limited. Facts and summaries only (from
+    wikipedia and friends), no news, so it's the last resort."""
+    async with http_session(headers=SEARCH_HEADERS) as session:
+        data = await get_json(session, "https://api.duckduckgo.com/",
+                              params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+    results = []
+    if data.get("Answer"):
+        results.append({"title": f"Instant answer: {data.get('AnswerType') or 'answer'}",
+                        "url": data.get("AbstractURL") or "https://duckduckgo.com", "snippet": str(data["Answer"])})
+    if data.get("AbstractText"):
+        results.append({"title": data.get("Heading") or query, "url": data.get("AbstractURL", ""),
+                        "snippet": data["AbstractText"]})
+    for topic in data.get("RelatedTopics") or []:
+        for t in topic.get("Topics") or [topic]:   # some come grouped in categories
+            if t.get("FirstURL") and t.get("Text"):
+                results.append({"title": t["Text"].split(" - ")[0], "url": t["FirstURL"], "snippet": t["Text"]})
+    return results
+
+
+async def search_results(query, region="us-en"):
+    """Web results through every backend we have, best first. Returns (results, source).
+    results is None only when every backend failed; [] means it worked and found nothing.
+
+    order: cache, your SearXNG (if SEARXNG_URL is set), ddg html then lite (skipped while
+    cooling down from a 202), the ddgs package (other engines), then ddg instant answers
+    for plain queries.
+    """
+    global _ddg_blocked_until
+    key = (query.lower(), region)
+    hit = _search_cache.get(key)
+    if hit and time.time() - hit[0] < SEARCH_CACHE_TTL:
+        return hit[1], f"{hit[2]}, cached"
+
+    async def attempt(name, coro):
+        try:
+            return await coro
+        except Exception as e:
+            print(f"[search] {name} {type(e).__name__}: {e}")
+            return None
+
+    results, source = None, None
+    if searxng_url():
+        results, source = await attempt("searxng", searxng_results(query, region)), "searxng"
+
+    if results is None and time.time() >= _ddg_blocked_until:
+        found = await attempt("ddg", ddg_results(query, region))
+        if found:
+            results, status = found
+            source = "duckduckgo"
+            if results is None and status == 202:
+                _ddg_blocked_until = time.time() + DDG_COOLDOWN
+                print(f"[search] ddg is rate limiting us, skipping it for {DDG_COOLDOWN}s")
+
+    if not results:
+        # ddg blocked us, is cooling down, or came back empty: let ddgs try other engines
+        more = await ddgs_results(query, region)
+        if more:
+            results, source = more, "ddgs"
+
+    # instant answers know nothing about site: filters, so those can't use it
+    if results is None and not query.lower().startswith("site:"):
+        # empty here means "the real search is down and this one knew nothing", which is
+        # not the same as the web having no results, so it counts as a failure
+        results, source = (await attempt("ddg instant", ddg_instant_results(query))) or None, "ddg instant answers"
+
+    if results is not None:
+        _search_cache[key] = (time.time(), results, source)
+        while len(_search_cache) > SEARCH_CACHE_MAX:
+            _search_cache.pop(next(iter(_search_cache)))
+    return results, source
+
+
 async def web_search_tool(query: str, region: str = "us-en"):
     """Searches the web and returns the top results, each with a title, url and snippet.
 
@@ -262,20 +387,16 @@ async def web_search_tool(query: str, region: str = "us-en"):
     if not query:
         return "no query given"
 
-    try:
-        results, last_status = await ddg_results(query, region)
-    except Exception as e:
-        print(f"[search] {type(e).__name__}: {e}")
-        return "the search failed, couldn't reach it"
-
+    results, source = await search_results(query, region)
     if results is None:
-        if last_status == 202:
-            return "the search is rate limited right now, try again in a bit"
-        return f"the search failed ({last_status})"
+        # worded so the model gives up on searching instead of calling it again, which
+        # only digs the rate limit deeper
+        return ("web search is unavailable right now. don't search again in this reply: answer "
+                "with what you already have and tell the user the search is down for a bit")
     if not results:
         return f"no results for {query!r}"
 
-    print(f"[search] {query!r} -> {len(results)} result(s)")
+    print(f"[search] {query!r} -> {len(results)} result(s) via {source}")
 
     chunks = []
     for r in results[:WEB_SEARCH_RESULTS]:
@@ -528,7 +649,7 @@ async def _wiki_search(session, api, query, archwiki):
     # the arch wiki's own search is dumb (plain srsearch only matches titles, full text
     # ranks random hardware pages first), so ask ddg about the site and keep english pages
     try:
-        results, _ = await ddg_results(f"site:wiki.archlinux.org {query}")
+        results, _ = await search_results(f"site:wiki.archlinux.org {query}")
     except Exception as e:
         print(f"[wiki] ddg {type(e).__name__}: {e}")
         results = None
@@ -560,14 +681,10 @@ ALPINE_PAGE_RE = re.compile(r"^https://wiki\.alpinelinux\.org/wiki/([^?#]+)")
 async def _alpine_wiki(query):
     """The alpine wiki blocks its api with an anti-bot wall but serves plain article
     pages, so pages are found with a ddg site search and read like any other page."""
-    try:
-        results, status = await ddg_results(f"site:wiki.alpinelinux.org {query}")
-    except Exception as e:
-        print(f"[wiki] alpine ddg {type(e).__name__}: {e}")
-        return "couldn't search the alpine wiki right now"
+    results, _ = await search_results(f"site:wiki.alpinelinux.org {query}")
     if results is None:
-        return ("the alpine wiki search is rate limited right now, try again in a bit"
-                if status == 202 else f"the alpine wiki search failed ({status})")
+        return ("the alpine wiki search is unavailable right now (it goes through web search). "
+                "don't retry in this reply, answer from what you know")
 
     pages = []
     for r in results:

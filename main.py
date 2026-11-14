@@ -333,6 +333,7 @@ class ToolRun:
         self.image_gens = 0
         self.video_gens = 0
         self.image_views = 0
+        self.usage = {}                    # ollama token counts, see ollama_chat
 
     def add_image(self, data_or_url):
         name = f"img{len(self.images) + 1}"
@@ -1124,7 +1125,15 @@ class StatusLine:
             await asyncio.gather(task, return_exceptions=True)
 
 
-async def ollama_chat(model, messages, tools=None, think=None, on_phase=None):
+def _record_usage(usage, data):
+    if usage is None:
+        return
+    usage["calls"] = usage.get("calls", 0) + 1
+    usage["prompt"] = data.get("prompt_eval_count") or usage.get("prompt", 0)
+    usage["output"] = usage.get("output", 0) + (data.get("eval_count") or 0)
+
+
+async def ollama_chat(model, messages, tools=None, think=None, on_phase=None, usage=None):
     """POST /api/chat over aiohttp. Returns the response's message dict.
 
     This exists instead of ollama.chat because the sync client has to run inside
@@ -1134,6 +1143,9 @@ async def ollama_chat(model, messages, tools=None, think=None, on_phase=None):
 
     With on_phase it streams, and calls on_phase("thinking") / on_phase("writing") as the
     model moves from reasoning to answering, which is what drives the status line.
+
+    With usage (a dict) it records ollama's own token counts: "prompt" is the size of the
+    prompt this call sent, "output" accumulates the tokens generated across calls.
     """
     stream = on_phase is not None
     payload = {
@@ -1152,6 +1164,7 @@ async def ollama_chat(model, messages, tools=None, think=None, on_phase=None):
                 raise RuntimeError(f"ollama {resp.status}: {(await resp.text())[:300]}")
             if not stream:
                 data = await resp.json()
+                _record_usage(usage, data)
                 return data.get("message") or {}
 
             # streamed: one json object per line, each holding a sliver of the message
@@ -1178,6 +1191,7 @@ async def ollama_chat(model, messages, tools=None, think=None, on_phase=None):
                     phase = new_phase
                     on_phase(phase)
                 if chunk.get("done"):
+                    _record_usage(usage, chunk)   # only the final chunk carries the counts
                     break
 
     msg = {"role": "assistant", "content": "".join(content)}
@@ -1219,7 +1233,7 @@ async def chat_with_tools(model, messages, run):
         offered = await asyncio.to_thread(tool_schemas)   # reads skills/ if it changed
         known = {t["function"]["name"] for t in offered}
         msg = await asyncio.wait_for(
-            ollama_chat(model, convo, tools=offered, on_phase=on_phase),
+            ollama_chat(model, convo, tools=offered, on_phase=on_phase, usage=run.usage),
             timeout=OLLAMA_TIMEOUT,
         )
 
@@ -1227,6 +1241,7 @@ async def chat_with_tools(model, messages, run):
         calls = [c for c in (msg.get("tool_calls") or [])
                  if (c.get("function") or {}).get("name") in known]
         if not calls:
+            remember_usage(run)
             return str(msg.get("content") or "")
 
         convo.append(msg)
@@ -1260,7 +1275,9 @@ async def chat_with_tools(model, messages, run):
     # it just kept calling tools, so take one more round with no tools offered, which
     # leaves it nothing to do but write the reply
     on_phase("results")
-    msg = await asyncio.wait_for(ollama_chat(model, convo, on_phase=on_phase), timeout=OLLAMA_TIMEOUT)
+    msg = await asyncio.wait_for(ollama_chat(model, convo, on_phase=on_phase, usage=run.usage),
+                                 timeout=OLLAMA_TIMEOUT)
+    remember_usage(run)
     return str(msg.get("content") or "")
 
 
@@ -1282,6 +1299,14 @@ async def deliver_reply(text, run, send_first, send_more):
     for extra in chunks[1:]:
         sent.append(await send_more(extra))
     return sent
+
+last_usage = {}   # user id -> token counts from their latest reply, for /usage
+
+
+def remember_usage(run):
+    if run.usage:
+        last_usage[run.user_id] = {**run.usage, "tools": list(run.tools_used), "time": time.time()}
+
 
 def trim(history):
     if len(history) > MAX_TURNS + 1:
@@ -1744,6 +1769,49 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
 async def reset(ctx: discord.ApplicationContext):
     histories.pop(ctx.author.id, None)
     await ctx.respond("Memory wiped. Who are you again?")
+
+def _approx_tokens(text):
+    return len(text) // 4   # rough rule of thumb for english, real tokenizers vary
+
+
+def _bar(fraction, width=16):
+    filled = max(0, min(width, round(fraction * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+@bot.slash_command(name="usage", description="See how much of the AI's memory your conversation is using.")
+async def usage(ctx: discord.ApplicationContext):
+    history = histories.get(ctx.author.id) or []
+    turns = [m for m in history if m.get("role") != "system"]
+    system = history[0]["content"] if history and history[0].get("role") == "system" else SYSTEM_PROMPT
+    history_tokens = sum(_approx_tokens(str(m.get("content") or "")) for m in turns)
+    fixed_tokens = _approx_tokens(system) + _approx_tokens(json.dumps(await asyncio.to_thread(tool_schemas)))
+    estimate = fixed_tokens + history_tokens
+
+    lines = ["## Your AI memory"]
+    lines.append(f"**History:** {len(turns)}/{MAX_TURNS} messages saved "
+                 + ("(full, the oldest ones drop off as you keep chatting)" if len(turns) >= MAX_TURNS
+                    else f"({MAX_TURNS - len(turns)} more before the oldest start dropping off)"))
+    lines.append(f"**Estimated size now:** ~{estimate:,} / {OLLAMA_NUM_CTX:,} tokens "
+                 f"`{_bar(estimate / OLLAMA_NUM_CTX)}` {estimate / OLLAMA_NUM_CTX:.0%}")
+    lines.append(f"-# ~{history_tokens:,} of that is your messages, ~{fixed_tokens:,} is the system prompt and tool list")
+
+    last = last_usage.get(ctx.author.id)
+    if last:
+        prompt = last.get("prompt", 0)
+        lines.append(f"**Last reply** (<t:{int(last['time'])}:R>, real counts from the model): "
+                     f"{prompt:,} / {OLLAMA_NUM_CTX:,} tokens in "
+                     f"`{_bar(prompt / OLLAMA_NUM_CTX)}` {prompt / OLLAMA_NUM_CTX:.0%}, "
+                     f"{last.get('output', 0):,} generated over {last.get('calls', 1)} model call(s)")
+        if last.get("tools"):
+            lines.append(f"-# tools used: {', '.join(last['tools'])}")
+        if prompt >= OLLAMA_NUM_CTX * 0.9:
+            lines.append("**Heads up:** that's nearly the limit, anything past it gets cut off. `/reset` clears it.")
+    else:
+        lines.append("**Last reply:** none since the bot started")
+    lines.append("-# channel context and tool results get added on top while it's replying. `/reset` wipes your history")
+    await ctx.respond("\n".join(lines), ephemeral=True)
+
 
 @bot.slash_command(name="change_model", description="Change the model.")
 async def change_model(ctx: discord.ApplicationContext):
