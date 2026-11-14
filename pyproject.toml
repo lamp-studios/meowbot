@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "beautifulsoup4>=4.15.0",
     "kokoro-onnx>=0.6.1",
     "numpy>=2.5.2",
     "ollama>=0.6.2",
@@ -13,8 +14,10 @@ dependencies = [
     "pipreqs>=0.5.0",
     "py-cord[voice]>=2.8.1",
     "pynacl>=1.6.2",
+    "pypdf>=7.1.0",
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
     "soundfile>=0.14.0",
+    "tzdata>=2026.6",
     "wavelink>=3.5.2",
 ]

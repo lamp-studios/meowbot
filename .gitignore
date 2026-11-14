@@ -10,8 +10,9 @@ wheels/
 .venv
 .env
 
-testing.py
-tesitng2.py
+test2.py
+test3.py
+test4.py
 
 gen_usage.json
 gen_usage.db
