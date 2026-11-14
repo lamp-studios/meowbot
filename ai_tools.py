@@ -977,6 +977,18 @@ SPORTS_LEAGUES = {
     "ligue-1": "soccer/fra.1",
     "mls": "soccer/usa.1",
     "champions-league": "soccer/uefa.champions",
+    # rugby leagues are numeric ids on espn (from sports.core.api.espn.com/v2/sports/rugby/leagues)
+    "nations-championship": "rugby/17567",     # the autumn/summer internationals since 2026
+    "six-nations": "rugby/180659",
+    "rugby-world-cup": "rugby/164205",
+    "rugby-championship": "rugby/244293",
+    "rugby-tests": "rugby/289234",             # other international test matches
+    "premiership-rugby": "rugby/267979",
+    "urc": "rugby/270557",
+    "top-14": "rugby/270559",
+    "champions-cup": "rugby/271937",
+    "super-rugby": "rugby/242041",
+    "major-league-rugby": "rugby/289262",
 }
 LEAGUE_ALIASES = {
     "football": "nfl", "american football": "nfl", "ncaaf": "college-football",
@@ -984,6 +996,12 @@ LEAGUE_ALIASES = {
     "epl": "premier-league", "premier league": "premier-league", "soccer": "premier-league",
     "laliga": "la-liga", "la liga": "la-liga", "serie a": "serie-a", "ligue 1": "ligue-1",
     "ucl": "champions-league", "champions league": "champions-league",
+    "rugby": "nations-championship", "rugby union": "nations-championship",
+    "international rugby": "nations-championship", "nations championship": "nations-championship",
+    "6 nations": "six-nations", "six nations": "six-nations", "rwc": "rugby-world-cup",
+    "rugby world cup": "rugby-world-cup", "premiership": "premiership-rugby",
+    "gallagher prem": "premiership-rugby", "united rugby championship": "urc",
+    "top14": "top-14", "super rugby": "super-rugby", "mlr": "major-league-rugby",
 }
 SPORTS_MAX_GAMES = 10
 
@@ -1029,8 +1047,12 @@ async def sports(league: str, team: str = ""):
     """Gets live scores, results and upcoming games for a sports league.
 
     league is one of: nfl, college-football, nba, wnba, college-basketball, mlb, nhl,
-    premier-league, la-liga, bundesliga, serie-a, ligue-1, mls, champions-league.
+    premier-league, la-liga, bundesliga, serie-a, ligue-1, mls, champions-league, and for
+    rugby union: nations-championship (international matches like Ireland vs Fiji),
+    six-nations, rugby-world-cup, rugby-championship, rugby-tests, premiership-rugby, urc,
+    top-14, champions-cup, super-rugby, major-league-rugby.
     Pass a team name to get that team's recent and upcoming games instead of today's.
+    Use this instead of web search for any score or fixture in these leagues.
     """
     key = (league or "").strip().lower()
     key = LEAGUE_ALIASES.get(key, key.replace(" ", "-"))
@@ -1061,13 +1083,22 @@ async def sports(league: str, team: str = ""):
                 if not found:
                     return f"couldn't find a {key} team matching {team!r}"
                 sched_url = f"{base}/teams/{found['id']}/schedule"
-                # soccer schedules only list played games unless fixtures are asked for too
-                results = await get_json(session, sched_url)
-                events = list(results.get("events") or [])
-                if path.startswith("soccer/"):
-                    fixtures = await get_json(session, sched_url, params={"fixture": "true"})
-                    seen = {e.get("id") for e in events}
-                    events += [e for e in fixtures.get("events") or [] if e.get("id") not in seen]
+                try:
+                    # soccer schedules only list played games unless fixtures are asked for too
+                    results = await get_json(session, sched_url)
+                    events = list(results.get("events") or [])
+                    if path.startswith("soccer/"):
+                        fixtures = await get_json(session, sched_url, params={"fixture": "true"})
+                        seen = {e.get("id") for e in events}
+                        events += [e for e in fixtures.get("events") or [] if e.get("id") not in seen]
+                except ToolError:
+                    # espn's schedule endpoint 500s for rugby, so take the league's current
+                    # scoreboard and keep this team's games
+                    board = await get_json(session, f"{base}/scoreboard")
+                    team_id = str(found.get("id"))
+                    events = [e for e in board.get("events") or []
+                              if any(str((c.get("team") or {}).get("id")) == team_id
+                                     for c in (e.get("competitions") or [{}])[0].get("competitors") or [])]
     except ToolError as e:
         return f"sports failed: {e}"
     except Exception as e:
