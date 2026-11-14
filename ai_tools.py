@@ -268,24 +268,51 @@ async def searxng_results(query, region="us-en"):
     json in search.formats, or every request comes back 403."""
     lang = region.split("-")[-1] if "-" in region else "en"
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout, headers=SEARCH_HEADERS) as session:
+    # it's our own instance: say where the request comes from, or searxng's bot detection
+    # (when its limiter is on) can refuse it for having no forwarding headers
+    headers = {**SEARCH_HEADERS, "Accept": "application/json, text/html;q=0.9",
+               "X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(f"{searxng_url()}/search",
                                params={"q": query, "format": "json", "language": lang}) as resp:
-            if resp.status != 200:
-                print(f"[search] searxng -> {resp.status}"
-                      + (" (is json enabled in its settings.yml?)" if resp.status == 403 else ""))
-                return None
-            data = await resp.json(content_type=None)
+            body = await resp.text()
+            status, ctype, final = resp.status, resp.headers.get("Content-Type", "?"), str(resp.url)
+    if status != 200:
+        print(f"[search] searxng -> {status}"
+              + (" (is json enabled in its settings.yml?)" if status == 403 else ""))
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        # a 200 that isn't json: wrong SEARXNG_URL (another service on that port), a proxy
+        # in front of it, or searxng's own block page. the body usually says which
+        print(f"[search] searxng sent {ctype} instead of json from {final}: {body[:200]!r}")
+        return None
     return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content") or ""}
             for r in data.get("results") or [] if r.get("url")]
 
 
+DDGS_BACKENDS = ("yahoo", "auto")   # yahoo first: "auto" picks its own engines and can skip
+                                    # yahoo, which was the only one working on a flagged ip
+
+
 def _ddgs_text(query, region):
     from ddgs import DDGS   # imported here so a broken ddgs install can't stop the bot starting
-    rows = DDGS(timeout=HTTP_TIMEOUT).text(query, region=region, safesearch="moderate",
-                                           max_results=WEB_SEARCH_RESULTS * 2)
-    return [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body") or ""}
-            for r in rows or [] if r.get("href")]
+    last_error = None
+    for backend in DDGS_BACKENDS:
+        try:
+            rows = DDGS(timeout=HTTP_TIMEOUT).text(query, region=region, safesearch="moderate",
+                                                   backend=backend, max_results=WEB_SEARCH_RESULTS * 2)
+        except Exception as e:   # "No results found" is what it says when an engine blocks us
+            last_error = e
+            continue
+        results = [{"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body") or ""}
+                   for r in rows or [] if r.get("href")]
+        if results:
+            return results
+    if last_error:
+        raise last_error
+    return []
 
 
 async def ddgs_results(query, region="us-en"):
