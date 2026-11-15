@@ -22,3 +22,7 @@ gen_usage.db.tmp
 # kokoro model files (too big for github, download them from the kokoro-onnx releases)
 kokoro-v1.0.onnx
 voices-v1.0.bin
+# persistent memory database (chat logs, keep private)
+memory.db
+memory.db-wal
+memory.db-shm

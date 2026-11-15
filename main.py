@@ -13,6 +13,7 @@ import urllib.parse
 import ai_tools
 import github_tools
 import skills
+import memory_store
 import numpy as np
 from kokoro_onnx import Kokoro
 import requests
@@ -319,6 +320,33 @@ async def openrouter_video(session, prompt, on_status=None):
 
 # ---------- per-reply tool state ----------
 
+IMAGE_MEMORY = 8              # images remembered per user for view_image, oldest dropped
+IMAGE_MEMORY_TTL = 2 * 60 * 60   # and forgotten after this long (discord cdn links expire anyway)
+user_images = {}              # user id -> {"next": int, "items": {name: (time, bytes or url, label)}}
+
+
+def image_store(user_id):
+    """This user's remembered images, with expired ones dropped. Kept across replies so
+    "describe the image you just made" in the NEXT message can still find img1."""
+    store = user_images.setdefault(user_id, {"next": 1, "items": {}})
+    now = time.time()
+    for name in [n for n, (t, _, _) in store["items"].items() if now - t > IMAGE_MEMORY_TTL]:
+        del store["items"][name]
+    return store
+
+
+def remember_image(user_id, data_or_url, label):
+    """Store an image under a fresh name (img1, img2...) and return the name. Names keep
+    counting up instead of reusing slots, so an old name never points at a new image."""
+    store = image_store(user_id)
+    name = f"img{store['next']}"
+    store["next"] += 1
+    store["items"][name] = (time.time(), data_or_url, label)
+    while len(store["items"]) > IMAGE_MEMORY:
+        store["items"].pop(next(iter(store["items"])))
+    return name
+
+
 class ToolRun:
     """Everything one chat reply's tools need to know, and everything they produced."""
 
@@ -328,17 +356,28 @@ class ToolRun:
         self.status = status               # StatusLine or None
         self.files = []                    # (bytes, filename) to attach to the reply
         self.links = []                    # urls appended to the reply (soggy pics, oversized videos)
-        self.images = {}                   # "img1" -> bytes or url, so view_image can look at them
+        self.new_images = []               # (name, label) made during this reply
         self.tools_used = []
         self.image_gens = 0
         self.video_gens = 0
         self.image_views = 0
         self.usage = {}                    # ollama token counts, see ollama_chat
 
-    def add_image(self, data_or_url):
-        name = f"img{len(self.images) + 1}"
-        self.images[name] = data_or_url
+    @property
+    def images(self):
+        """name -> bytes or url, for every image this user has around (not just this reply)."""
+        return {name: data for name, (_, data, _) in image_store(self.user_id)["items"].items()}
+
+    def add_image(self, data_or_url, label="image"):
+        name = remember_image(self.user_id, data_or_url, label)
+        self.new_images.append((name, label))
         return name
+
+    def image_note(self):
+        """A line for the stored history, so later turns know these names exist."""
+        if not self.new_images:
+            return ""
+        return "\n[images attached to this reply: " + ", ".join(f"{n} ({label})" for n, label in self.new_images) + "]"
 
     async def tool_start(self, key, label):
         if self.status:
@@ -410,7 +449,7 @@ async def generate_image(prompt: str, *, run: ToolRun, key="generate_image"):
                 errors.append(provider)
                 continue
 
-            name = run.add_image(data)
+            name = run.add_image(data, f"generated: {prompt[:60]}")
             run.files.append((data, f"{name}_generated.png"))
             print(f"[gen tool] image via {provider} for {run.user_id}")
             note = ""
@@ -483,8 +522,9 @@ async def view_image(source: str, *, run: ToolRun):
         elif target.startswith(("http://", "https://")):
             data = await ai_tools.download_image(target)
         else:
-            names = ", ".join(run.images) or "none yet"
-            return None, f"that's not an image url or a known image name (known: {names})"
+            known = image_store(run.user_id)["items"]
+            names = ", ".join(f"{n} ({label})" for n, (_, _, label) in known.items()) or "none"
+            return None, f"that's not an image url or a known image name. images you can view: {names}"
         b64 = await asyncio.to_thread(ai_tools.prepare_image, data)
     except ai_tools.ToolError as e:
         return None, f"couldn't load the image: {e}"
@@ -568,7 +608,31 @@ def tool_schemas():
     """The tools offered this round. use_skill is rebuilt each time so its list of skills
     (and whether it exists at all) follows whatever is in skills/ right now."""
     skill_tool = skills.use_skill_schema()
-    return TOOL_SCHEMAS + ([skill_tool] if skill_tool else [])
+    extra = [skill_tool] if skill_tool else []
+    if MEMORY.enabled():   # remembering only makes sense while there's somewhere to keep it
+        extra += MEMORY_TOOL_SCHEMAS
+    return TOOL_SCHEMAS + extra
+
+
+def save_memory(fact: str):
+    """Saves a lasting fact about the user you are talking to, so you still know it in
+    future chats, even after this conversation scrolls out of your memory.
+
+    Use it when they tell you something worth keeping about themselves (their name,
+    pronouns, preferences, what they're working on) or ask you to remember something.
+    Write the fact as one short sentence about them, like "likes rust and hates java".
+    """
+
+
+def forget_memory(fact: str):
+    """Deletes saved facts about the user that contain this text. Use it when they ask
+    you to forget something, or a saved fact turns out to be wrong."""
+
+
+MEMORY_TOOL_SCHEMAS = [
+    _tool_schema(save_memory, {"fact": {"type": "string", "description": "one short sentence about the user"}}, ["fact"]),
+    _tool_schema(forget_memory, {"fact": {"type": "string", "description": "text that appears in the memory to delete"}}, ["fact"]),
+]
 
 
 def tool_label(name, args):
@@ -595,6 +659,10 @@ def tool_label(name, args):
         return f"reading {where} on GitHub..."
     if name == "github_user":
         return f"checking {short(args.get('username'), 30)}'s GitHub..."
+    if name == "save_memory":
+        return "saving that to memory..."
+    if name == "forget_memory":
+        return "forgetting that..."
     if name == "use_skill":
         return f"loading the {short(args.get('name'), 30)} skill..."
     if name == "fetch_page":
@@ -651,6 +719,10 @@ async def run_tool(name, args, run, key):
                                                   args.get("start_line") or 1), None
         if name == "github_user":
             return await github_tools.github_user(str(args.get("username") or "")), None
+        if name == "save_memory":
+            return MEMORY.add_memory(run.user_id, str(args.get("fact") or "")), None
+        if name == "forget_memory":
+            return MEMORY.forget_memory(run.user_id, str(args.get("fact") or "")), None
         if name == "use_skill":
             return await asyncio.to_thread(skills.use_skill, str(args.get("name") or "")), None
         if name == "news":
@@ -674,7 +746,7 @@ async def run_tool(name, args, run, key):
             return text, b64
         url = await asyncio.to_thread(soggy_cat_api_tool)   # blocking requests.get
         run.links.append(url)
-        name_ = run.add_image(url)
+        name_ = run.add_image(url, "soggy cat photo")
         return f"{url}\n(saved as {name_}, it is attached to your reply. view_image('{name_}') shows it to you)", None
     except Exception as e:
         print(f"[tool] {name} crashed: {type(e).__name__}: {e}")
@@ -968,10 +1040,43 @@ async def tts_say(guild_id: int, text: str):
     await tts_queues[guild_id].put(text)
 
 
+MEMORY = memory_store.MemoryStore()   # memory.db next to this file, off until /persistent_memory
+
+
 def get_history(user_id):
     if user_id not in histories:
-        histories[user_id] = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+        stored = MEMORY.load_history(user_id) if MEMORY.enabled() else None
+        if stored:
+            # the saved copy carries whatever system prompt was current back then, so the
+            # live one replaces it and edits to SYSTEM_PROMPT still apply after a restart
+            turns = [m for m in stored if m.get("role") != "system"]
+            histories[user_id] = [{'role': 'system', 'content': SYSTEM_PROMPT}] + turns
+        else:
+            histories[user_id] = [{'role': 'system', 'content': SYSTEM_PROMPT}]
     return histories[user_id]
+
+
+def memory_context_for(user_id):
+    """Saved facts about this user as a system message, while persistent memory is on."""
+    if not MEMORY.enabled():
+        return []
+    facts = MEMORY.memories(user_id)
+    if not facts:
+        return []
+    lines = "\n".join(f"- {fact}" for _, fact in facts)
+    return [{'role': 'system', 'content': f"Things you remember about this user from earlier chats:\n{lines}"}]
+
+
+def persist_turn(user_id, history, user_text, reply_text):
+    """Save the conversation after a reply. Does nothing while persistent memory is off."""
+    if not MEMORY.enabled():
+        return
+    try:
+        MEMORY.save_history(user_id, history)
+        MEMORY.log(user_id, "user", user_text)
+        MEMORY.log(user_id, "assistant", reply_text)
+    except Exception as e:   # a full disk or locked db shouldn't take the reply down with it
+        print(f"[memory] couldn't save chat for {user_id}: {type(e).__name__}: {e}")
 
 def wants_soggy(prompt):
     """Whether the user brought soggy cat up at all."""
@@ -1396,6 +1501,15 @@ async def on_message(message: discord.Message):
 
     user_msg = {'role': 'user', 'content': f"<@{message.author.id}>: {prompt}"}
 
+    # images in the message they replied to (often one of ours, like a generated picture)
+    # get names too, so "what's in this?" as a reply can be answered with view_image
+    ref_msg = message.reference.resolved if message.reference else None
+    if isinstance(ref_msg, discord.Message):
+        ref_names = [remember_image(message.author.id, a.url, "image in the message they replied to")
+                     for a in ref_msg.attachments if (a.content_type or "").startswith("image/")]
+        if ref_names:
+            user_msg['content'] += f"\n[the message they replied to has images: {', '.join(ref_names)}]"
+
     image = next((a for a in message.attachments if (a.content_type or "").startswith("image/")), None)
     model = CHAT_MODEL
 
@@ -1403,6 +1517,8 @@ async def on_message(message: discord.Message):
         image_bytes = await image.read()
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         user_msg['images'] = [image_data]
+        name = remember_image(message.author.id, image_bytes, "image the user sent")
+        user_msg['content'] += f"\n[their attached image is saved as {name}]"
         #model = 'gemma3:4b' # pain, no longer needed, CHAT_MODEL handles images
 
     history.append(user_msg)
@@ -1414,6 +1530,7 @@ async def on_message(message: discord.Message):
     to_send += channel_context_for(message.channel.id)   # empty unless the channel opted in
     to_send += soggy_lore_for(prompt)   # only when they actually mentioned him
     to_send += await asyncio.to_thread(skills.skill_context_for, prompt)   # skills whose triggers it hits
+    to_send += memory_context_for(message.author.id)   # saved facts, only with persistent memory on
     to_send.append(history[-1])
 
     # the system prompt teaches it <@id> syntax, so let it ping people but not the whole server
@@ -1462,12 +1579,13 @@ async def on_message(message: discord.Message):
     remember_channel_line(message.channel.id, bot.user.display_name, text)
 
     # stored without links too, so the next turn has nothing to copy and has to use the tool
-    history.append({'role': 'assistant', 'content': text})
+    history.append({'role': 'assistant', 'content': text + run.image_note()})
     # drop the image from the stored version so it doesn't sit in memory forever
     if 'images' in history[-2]:
         del history[-2]['images']
 
     trim(history)
+    persist_turn(message.author.id, history, prompt, text)
 
     async def send_first(content, files):
         extra = {"files": files} if files else {}
@@ -1655,6 +1773,8 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
         image_bytes = await image.read()
         image_data = base64.b64encode(image_bytes).decode("utf-8")
         user_msg['images'] = [image_data]
+        name = remember_image(ctx.author.id, image_bytes, "image the user sent")
+        user_msg['content'] += f"\n[their attached image is saved as {name}]"
         #model = 'gemma3:4b' # pain, no longer needed, CHAT_MODEL handles images
 
     history.append(user_msg)
@@ -1666,6 +1786,7 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     to_send += channel_context_for(ctx.channel.id)   # empty unless the channel opted in
     to_send += soggy_lore_for(prompt)   # only when they actually mentioned him
     to_send += await asyncio.to_thread(skills.skill_context_for, prompt)   # skills whose triggers it hits
+    to_send += memory_context_for(ctx.author.id)   # saved facts, only with persistent memory on
     to_send.append(history[-1])
     try:
         # one timeout for the whole thing, tool rounds included
@@ -1703,12 +1824,13 @@ async def ask(ctx: discord.ApplicationContext, prompt: str, image: discord.Attac
     remember_channel_line(ctx.channel.id, bot.user.display_name, text)
 
     # stored without links too, so the next turn has nothing to copy and has to use the tool
-    history.append({'role': 'assistant', 'content': text})
+    history.append({'role': 'assistant', 'content': text + run.image_note()})
     # drop the image from the stored version so it doesn't sit in memory forever
     if 'images' in history[-2]:
         del history[-2]['images']
 
     trim(history)
+    persist_turn(ctx.author.id, history, prompt, text)
 
     async def send_first(content, files):
         extra = {"files": files} if files else {}
@@ -1765,10 +1887,45 @@ async def definition(ctx: discord.ApplicationContext, prompt: str):
     for extra in chunks[1:]:
         await ctx.followup.send(extra, allowed_mentions=no_pings)
 
-@bot.slash_command(name="reset", description="Clear your conversation history.")
+@bot.slash_command(name="reset", description="Clear your conversation history and everything the bot remembers about you.")
 async def reset(ctx: discord.ApplicationContext):
     histories.pop(ctx.author.id, None)
-    await ctx.respond("Memory wiped. Who are you again?")
+    user_images.pop(ctx.author.id, None)
+    last_usage.pop(ctx.author.id, None)
+    # the saved copy goes too, even with persistent memory switched off, so turning the
+    # mode off never leaves someone's old chats sitting in the database
+    try:
+        removed = MEMORY.wipe_user(ctx.author.id)
+    except Exception as e:
+        print(f"[memory] wipe failed for {ctx.author.id}: {type(e).__name__}: {e}")
+        return await ctx.respond("Wiped your chat here, but deleting your saved data failed. Try again in a bit.",
+                                 ephemeral=True)
+    extra = " (and your saved chats and memories)" if removed else ""
+    await ctx.respond(f"Memory wiped{extra}. Who are you again?")
+
+
+@bot.slash_command(name="persistent_memory", description="Bot owner only: save chats and memories to disk so they survive restarts.")
+@discord.option("enabled", type=discord.SlashCommandOptionType.boolean, description="On or off", required=False, default=None)
+async def persistent_memory(ctx: discord.ApplicationContext, enabled: bool = None):
+    if not is_bot_owner(ctx.author):
+        return await ctx.respond("only the bot owner can change this", ephemeral=True)
+
+    if enabled is not None:
+        MEMORY.set_enabled(enabled)
+        print(f"[memory] persistent memory turned {'on' if enabled else 'off'} by {ctx.author.id}")
+
+    stats = MEMORY.stats()
+    state = "**on**" if MEMORY.enabled() else "**off**"
+    lines = [f"Persistent memory is {state}.",
+             f"-# database: `{os.path.basename(memory_store.DB_PATH)}`, {stats['messages']:,} logged messages "
+             f"from {stats['users']} users, {stats['memories']} saved memories"]
+    if enabled is True:
+        lines.append("Chats are now saved after every reply and reloaded after restarts, and the AI can "
+                     "save facts about people with its memory tools. `/reset` deletes a person's data.")
+    elif enabled is False:
+        lines.append("Nothing new gets saved now. What's already in the database stays (and loads again "
+                     "if you turn it back on), and `/reset` still deletes a person's data.")
+    await ctx.respond("\n".join(lines), ephemeral=True)
 
 def _approx_tokens(text):
     return len(text) // 4   # rough rule of thumb for english, real tokenizers vary
