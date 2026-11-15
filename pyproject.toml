@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "beautifulsoup4>=4.15.0",
+    "davey>=0.1.6,<0.2",
     "ddgs>=9.16.1",
+    "faster-whisper>=1.2.1",
     "kokoro-onnx>=0.6.1",
     "numpy>=2.5.2",
     "ollama>=0.6.2",

@@ -1,8 +1,13 @@
 """GitHub tools for the chat model: search, browse and read repositories, read profiles.
 
 Uses the public REST API. Without a token GitHub allows 60 requests an hour per IP (a repo
-overview costs 3), and code search needs a token at all. Set GITHUB_TOKEN in .env (a
-fine-grained token with no extra permissions is enough) to get 5000 an hour.
+overview costs 3), and code search needs a token at all. Set GITHUB_TOKEN in .env to get
+5000 an hour.
+
+The token is used on behalf of EVERY Discord user who talks to the bot, so it must not be
+able to see anything private: make it a fine-grained token with repository access set to
+"Public repositories (read-only)" and no other permissions. A classic token, or one with
+private repo access, would let anyone in chat read the owner's private code.
 
 Like ai_tools, every public function returns text for the model, errors included.
 """
@@ -63,17 +68,39 @@ def _session():
     return ai_tools.http_session(headers=_headers())
 
 
+# github's own naming rules. checked strictly because these go into api url paths, and
+# yarl resolves dot segments: a repo of "../.." would otherwise turn /repos/../../user into
+# GET /user, authenticated with our token
+OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+
+
+def _check_segments(value, what):
+    """Split a slash path and refuse anything that could climb out of where it belongs."""
+    parts = [p for p in value.split("/") if p]
+    if any(p in (".", "..") for p in parts):
+        raise ToolError(f"that {what} isn't valid")
+    return parts
+
+
 def _parse_repo(repo):
     """'owner/name', or any github repo/blob/tree url -> (owner, name, ref, path)."""
     repo = (repo or "").strip()
     m = REPO_URL_RE.match(repo)
     if m:
         owner, name, _, ref, path = m.groups()
-        return owner, name, ref, (path or "").strip("/")
-    m = re.match(r"^([\w.-]+)/([\w.-]+)$", repo)
-    if m:
-        return m.group(1), m.group(2), None, ""
-    raise ToolError("give the repo as owner/name or a github link")
+        path = (path or "").strip("/")
+    else:
+        m = re.match(r"^([\w.-]+)/([\w.-]+)$", repo)
+        if not m:
+            raise ToolError("give the repo as owner/name or a github link")
+        owner, name, ref, path = m.group(1), m.group(2), None, ""
+
+    if not OWNER_RE.match(owner) or not NAME_RE.match(name) or name in (".", ".."):
+        raise ToolError("that isn't a valid github owner/name")
+    if ref is not None:
+        _check_segments(ref, "branch or tag")
+    return owner, name, ref, path
 
 
 # ---------- search ----------
@@ -132,7 +159,8 @@ async def _repo_overview(session, owner, name, ref):
     repo = await _gh(session, f"/repos/{owner}/{name}")
     ref = ref or repo.get("default_branch") or "HEAD"
     readme_task = _gh(session, f"/repos/{owner}/{name}/readme", {"ref": ref})
-    tree_task = _gh(session, f"/repos/{owner}/{name}/git/trees/{urllib.parse.quote(ref)}", {"recursive": "1"})
+    # safe="" so a branch like feature/x is one encoded segment and can't add path levels
+    tree_task = _gh(session, f"/repos/{owner}/{name}/git/trees/{urllib.parse.quote(ref, safe='')}", {"recursive": "1"})
     readme, tree = await asyncio.gather(readme_task, tree_task, return_exceptions=True)
 
     parts = [
@@ -181,7 +209,10 @@ def _numbered(text, start_line):
 
 async def _repo_path(session, owner, name, ref, path, start_line):
     params = {"ref": ref} if ref else None
-    data = await _gh(session, f"/repos/{owner}/{name}/contents/{urllib.parse.quote(path)}", params)
+    # each segment quoted on its own, after ../ and ./ are refused, so the path can only
+    # ever point inside this repo's contents
+    safe_path = "/".join(urllib.parse.quote(p, safe="") for p in _check_segments(path, "file path"))
+    data = await _gh(session, f"/repos/{owner}/{name}/contents/{safe_path}", params)
 
     if isinstance(data, list):   # a directory
         rows = sorted(data, key=lambda e: (e.get("type") != "dir", e.get("name", "")))

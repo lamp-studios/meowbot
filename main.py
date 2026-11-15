@@ -14,6 +14,14 @@ import ai_tools
 import github_tools
 import skills
 import memory_store
+import warnings
+import voice_recv_patch
+import voice_listen
+
+# py-cord 2.8.1 can't receive DAVE-encrypted voice out of the box, see voice_recv_patch.py.
+# once patched, its "voice reception is currently broken" warning on every call is just noise
+if voice_recv_patch.apply():
+    warnings.filterwarnings("ignore", message="Voice reception is currently broken")
 import numpy as np
 from kokoro_onnx import Kokoro
 import requests
@@ -1040,6 +1048,144 @@ async def tts_say(guild_id: int, text: str):
     await tts_queues[guild_id].put(text)
 
 
+def stop_speaking(guild_id):
+    """Cut the bot off mid-sentence and drop whatever it was about to say next."""
+    queue = tts_queues.get(guild_id)
+    if queue:
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+    guild = bot.get_guild(guild_id)
+    vc = guild.voice_client if guild else None
+    if vc and vc.is_playing():
+        vc.stop()   # fires the player's after callback, which lets the tts worker move on
+
+
+# ---------- voice listening (/ai_tts listen:true) ----------
+listen_sessions = {}   # guild id -> {"sink": ListenSink, "channel": text channel to post in}
+voice_replies = {}     # (guild id, user id) -> the task answering what they last said
+
+
+def start_listening(vc, channel):
+    """Start hearing the VC. Replies get posted in `channel` and read out loud."""
+    guild_id = vc.guild.id
+    stop_listening(guild_id)
+
+    def on_speech_start(member):
+        # barge-in: someone talking over the bot shuts it up straight away
+        if vc.is_playing() or (tts_queues.get(guild_id) and not tts_queues[guild_id].empty()):
+            print(f"[voice] {member} started talking, cutting the bot off")
+        stop_speaking(guild_id)
+
+    def on_utterance(member, pcm):
+        key = (guild_id, member.id)
+        old = voice_replies.get(key)
+        if old and not old.done():
+            old.cancel()   # they said something new before we answered the last thing
+        voice_replies[key] = asyncio.create_task(voice_turn(guild_id, member, pcm))
+
+    sink = voice_listen.ListenSink(vc, bot.loop, on_speech_start, on_utterance)
+    sink.ignored.add(bot.user.id)
+    vc.start_recording(sink)
+    listen_sessions[guild_id] = {"sink": sink, "channel": channel}
+    voice_listen.preload()   # so the first sentence doesn't wait for the model to load
+    print(f"[voice] listening in {vc.channel} (guild {guild_id})")
+
+
+def stop_listening(guild_id):
+    session = listen_sessions.pop(guild_id, None)
+    for key in [k for k in voice_replies if k[0] == guild_id]:
+        task = voice_replies.pop(key)
+        if not task.done():
+            task.cancel()
+    if not session:
+        return
+    vc = session["sink"].vc
+    try:
+        if vc and vc.is_recording():
+            vc.stop_recording()
+    except Exception as e:
+        print(f"[voice] stop_recording failed: {type(e).__name__}: {e}")
+
+
+async def voice_turn(guild_id, member, pcm):
+    """Transcribe one thing someone said in VC, answer it in text, and say it out loud."""
+    session = listen_sessions.get(guild_id)
+    if not session:
+        return
+    channel = session["channel"]
+    try:
+        heard = await asyncio.to_thread(voice_listen.transcribe, pcm)
+    except Exception as e:
+        print(f"[voice] transcription failed: {type(e).__name__}: {e}")
+        return
+    if not heard:
+        return
+    print(f"[voice] {member} said: {heard}")
+
+    no_pings = discord.AllowedMentions.none()
+    said_msg = await channel.send(f"\U0001f399️ **{member.display_name}:** {heard}", allowed_mentions=no_pings)
+    remember_channel_line(channel.id, member.display_name, heard)
+
+    history = get_history(member.id)
+    history.append({'role': 'user', 'content':
+                    f"<@{member.id}> (said out loud in voice chat, transcribed by speech recognition so "
+                    f"words may be misheard; your reply is read aloud, so keep it short and plain): {heard}"})
+    to_send = [{'role': m['role'], 'content': m['content']} for m in history[:-1]]
+    to_send += channel_context_for(channel.id)
+    to_send += soggy_lore_for(heard)
+    to_send += await asyncio.to_thread(skills.skill_context_for, heard)
+    to_send += memory_context_for(member.id)
+    to_send.append(history[-1])
+
+    emoji = await get_loading_emoji()
+    status_msg = await said_msg.reply(f"{emoji} thinking...", allowed_mentions=no_pings)
+    status = StatusLine(status_msg, emoji)
+    run = ToolRun(member.id, channel.guild.filesize_limit, status)
+    try:
+        text = await asyncio.wait_for(chat_with_tools(CHAT_MODEL, to_send, run), timeout=REPLY_TIMEOUT)
+    except asyncio.CancelledError:
+        history.pop()
+        await status.close()
+        try:
+            await status_msg.delete()   # they kept talking, this answer is stale
+        except discord.HTTPException:
+            pass
+        raise
+    except Exception as e:
+        history.pop()
+        await status.close()
+        print(f"[voice] reply failed: {type(e).__name__}: {e}")
+        return await status_msg.edit(content="the AI broke. check the console.")
+    await status.close()
+
+    text = strip_soggy_urls(text)
+    if not text.strip():
+        text = "here you go!" if (run.links or run.files) else "uhh i got nothing, try again?"
+
+    vc = channel.guild.voice_client
+    if vc and vc.is_connected():
+        await tts_say(guild_id, text)
+
+    remember_channel_line(channel.id, bot.user.display_name, text)
+    history.append({'role': 'assistant', 'content': text + run.image_note()})
+    trim(history)
+    persist_turn(member.id, history, heard, text)
+
+    async def send_first(content, files):
+        extra = {"files": files} if files else {}
+        return await status_msg.edit(content=content, allowed_mentions=no_pings, **extra)
+
+    async def send_more(content):
+        return await channel.send(content, allowed_mentions=no_pings)
+
+    for sent in await deliver_reply(text, run, send_first, send_more):
+        remember_bot_msg(sent, member.id)
+
+
 MEMORY = memory_store.MemoryStore()   # memory.db next to this file, off until /persistent_memory
 
 
@@ -2013,7 +2159,8 @@ async def vnc(ctx: discord.ApplicationContext, online: bool, country: str, attem
 
 @bot.slash_command(name="ai_tts", description="Joins VC and reads new AI replies out loud (doesnt work with the User App)") # please work istg
 @discord.option("voice", description="Which voice to read replies in", choices=list(TTS_VOICES), required=False, default=TTS_DEFAULT_VOICE)
-async def ai_tts(ctx: discord.ApplicationContext, voice: str):
+@discord.option("listen", description="Also listen in the VC and answer what people say out loud", type=discord.SlashCommandOptionType.boolean, required=False, default=False)
+async def ai_tts(ctx: discord.ApplicationContext, voice: str, listen: bool = False):
     await ctx.defer()
 
     if not ctx.guild:
@@ -2035,9 +2182,20 @@ async def ai_tts(ctx: discord.ApplicationContext, voice: str):
     tts_voices[ctx.guild.id] = voice   # the worker picks this up on the next line it speaks
     tts_enabled.add(ctx.guild.id)
 
+    listening_note = ""
+    if listen:
+        try:
+            start_listening(vc, ctx.channel)
+            listening_note = (f"\n\U0001f399️ **Listening too:** talk in {vc.channel.mention} and I'll answer here "
+                              "and out loud. Talking over me cuts me off. Everything said in the VC gets "
+                              "transcribed into this channel. `/ai_tts_stop` to stop.")
+        except Exception as e:
+            print(f"[voice] couldn't start listening: {type(e).__name__}: {e}")
+            listening_note = "\nCouldn't start listening, check the console."
+
     if switched:
-        return await ctx.respond(f"Switched the voice to **{voice}** in {vc.channel.mention}.")
-    await ctx.respond(f"TTS on with the **{voice}** voice. Reading replies in {vc.channel.mention}.")
+        return await ctx.respond(f"Switched the voice to **{voice}** in {vc.channel.mention}.{listening_note}")
+    await ctx.respond(f"TTS on with the **{voice}** voice. Reading replies in {vc.channel.mention}.{listening_note}")
 
 @bot.slash_command(name="server_info", description="Gets information on a server.")
 async def server_info(ctx: discord.ApplicationContext):
@@ -2303,6 +2461,7 @@ async def ai_tts_stop(ctx: discord.ApplicationContext):
         return await ctx.respond("This only works in a server.")
 
     tts_enabled.discard(ctx.guild.id)
+    stop_listening(ctx.guild.id)
 
     worker = tts_workers.pop(ctx.guild.id, None)
     if worker:
