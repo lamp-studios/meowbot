@@ -76,6 +76,11 @@ class ListenSink(Sink):
         self.speakers = {}
         self.lock = threading.Lock()
         self.ignored = set()   # user ids never to listen to (the bot itself, other bots)
+        # for the periodic status line: frames heard and the loudest one, since last read
+        self.frames_in = 0
+        self.loudest = 0.0
+        self.heard_from = set()
+        self._reported = set()
 
     # ---- the interface py-cord calls ----
 
@@ -92,6 +97,13 @@ class ListenSink(Sink):
     def cleanup(self):
         self.speakers.clear()
 
+    def take_stats(self):
+        with self.lock:
+            stats = {"frames": self.frames_in, "loudest": round(self.loudest), "people": len(self.heard_from)}
+            self.frames_in, self.loudest = 0, 0.0
+            self.heard_from = set()
+        return stats
+
     def write(self, data, user):
         member = data.source if data is not None else None
         uid = getattr(member, "id", None)
@@ -100,8 +112,15 @@ class ListenSink(Sink):
         pcm = data.pcm
         if not pcm:
             return
-        with self.lock:
-            self._feed(uid, member, pcm)
+        # this runs inside py-cord's packet router, which stops recording for good on ANY
+        # exception, so nothing here is allowed to raise
+        try:
+            with self.lock:
+                self._feed(uid, member, pcm)
+        except Exception as e:
+            if type(e).__name__ not in self._reported:
+                self._reported.add(type(e).__name__)
+                print(f"[voice] sink error (ignored, listening continues): {type(e).__name__}: {e}")
 
     # ---- voice activity detection ----
 
@@ -110,7 +129,12 @@ class ListenSink(Sink):
         if s is None:
             s = self.speakers[uid] = _Speaker()
 
-        loud = frame_rms(pcm) >= SPEECH_RMS
+        rms = frame_rms(pcm)
+        self.frames_in += 1
+        self.heard_from.add(uid)
+        if rms > self.loudest:
+            self.loudest = rms
+        loud = rms >= SPEECH_RMS
         if not s.speaking:
             s.pre_roll.append(pcm)
             if len(s.pre_roll) > PRE_ROLL_FRAMES:

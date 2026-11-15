@@ -292,6 +292,275 @@ async def searxng_results(query, region="us-en"):
             for r in data.get("results") or [] if r.get("url")]
 
 
+FIRECRAWL_SEARCH = "https://api.firecrawl.dev/v2/search"
+FIRECRAWL_COOLDOWN = 60 * 60    # its free keyless tier is capped per ip per day: once it says
+                                # no, leave it alone for an hour instead of asking every search
+_firecrawl_blocked_until = 0.0
+
+
+async def firecrawl_results(query):
+    """Firecrawl's search api. Works with no key at all (a free daily allowance per ip), or
+    with FIRECRAWL_API_KEY in .env for a bigger one. Good, current results with snippets."""
+    global _firecrawl_blocked_until
+    if time.time() < _firecrawl_blocked_until:
+        return None
+    headers = {**SEARCH_HEADERS, "Content-Type": "application/json", "Accept": "application/json"}
+    key = os.getenv("FIRECRAWL_API_KEY")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    async with http_session(headers=headers) as session:
+        async with session.post(FIRECRAWL_SEARCH, json={"query": query, "limit": WEB_SEARCH_RESULTS * 2}) as resp:
+            status = resp.status
+            data = await resp.json(content_type=None) if status == 200 else None
+    if status in (401, 402, 403, 429):
+        _firecrawl_blocked_until = time.time() + FIRECRAWL_COOLDOWN
+        print(f"[search] firecrawl -> {status} (free allowance used up?), skipping it for an hour")
+        return None
+    if status != 200 or not data or not data.get("success"):
+        print(f"[search] firecrawl -> {status}")
+        return None
+    rows = (data.get("data") or {}).get("web") or []
+    return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("description") or ""}
+            for r in rows if r.get("url")]
+
+
+# ---------- keyless MCP search servers (exa, parallel, you.com) ----------
+# these companies offer their search free with no key, but only through MCP: the protocol
+# AI apps use for plugins. over http that's just json-rpc, so a tiny client is enough:
+# initialize once (the server hands back a session id), then call its search tool
+MCP_PROTOCOL = "2025-06-18"
+MCP_COOLDOWN = 30 * 60          # after a refusal (rate limit, auth), skip that server this long
+MCP_SERVERS = {
+    "exa": "https://mcp.exa.ai/mcp",
+    "parallel": "https://search.parallel.ai/mcp",
+    "tavily": "https://mcp.tavily.com/mcp/",
+    "you.com": "https://api.you.com/mcp?profile=free",   # 100 searches a day
+}
+MCP_HEADERS = {
+    # tavily's free tier needs no key but has to be asked for explicitly, or it answers 401
+    "tavily": {"X-Tavily-Access-Mode": "keyless"},
+}
+_mcp_sessions = {}              # server name -> session id
+_mcp_blocked_until = {}         # server name -> time
+
+
+class _MCPRefused(Exception):
+    pass
+
+
+async def _mcp_post(session, url, payload, sid=None, extra=None):
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               "MCP-Protocol-Version": MCP_PROTOCOL, **(extra or {})}
+    if sid:
+        headers["Mcp-Session-Id"] = sid
+    _check_url(url)
+    async with session.post(url, json=payload, headers=headers) as resp:
+        body = await resp.text()
+        status = resp.status
+        new_sid = resp.headers.get("Mcp-Session-Id") or sid
+        ctype = resp.headers.get("Content-Type", "")
+    if status in (401, 402, 403, 429):
+        raise _MCPRefused(f"http {status}")
+    if status == 404 and sid:
+        raise LookupError("session expired")
+    if status not in (200, 202):
+        raise ToolError(f"http {status}")
+    data = None
+    if "event-stream" in ctype:   # the answer comes as server-sent events: take the json-rpc one
+        for line in body.splitlines():
+            if line.startswith("data:"):
+                try:
+                    data = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+    elif body.strip():
+        data = json.loads(body)
+    return data, new_sid
+
+
+async def _mcp_tool(name, tool, arguments):
+    """Call one tool on a keyless MCP server and return its text output."""
+    url = MCP_SERVERS[name]
+    extra = MCP_HEADERS.get(name)
+    if name == "tavily" and os.getenv("TAVILY_API_KEY"):
+        # a free tavily account key (1000 searches a month) instead of the tiny keyless cap
+        extra = {"Authorization": f"Bearer {os.getenv('TAVILY_API_KEY')}"}
+    async with http_session(headers=SEARCH_HEADERS) as session:
+        for _ in range(2):   # second go only if a cached session had expired
+            sid = _mcp_sessions.get(name)
+            if not sid:
+                init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": MCP_PROTOCOL, "capabilities": {},
+                    "clientInfo": {"name": "meowbot", "version": "1.0"}}}
+                _, sid = await _mcp_post(session, url, init, extra=extra)
+                await _mcp_post(session, url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, sid, extra)
+                _mcp_sessions[name] = sid
+            call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments}}
+            try:
+                data, _ = await _mcp_post(session, url, call, sid, extra)
+            except LookupError:
+                _mcp_sessions.pop(name, None)
+                continue
+            break
+        else:
+            raise ToolError("couldn't keep a session")
+    if not data:
+        raise ToolError("empty answer")
+    if data.get("error"):
+        message = str(data["error"].get("message", data["error"]))
+        if "rate" in message.lower() or "limit" in message.lower():
+            raise _MCPRefused(message)
+        raise ToolError(message)
+    result = data.get("result") or {}
+    text = "\n".join(c.get("text", "") for c in result.get("content") or [] if c.get("type") == "text")
+    if result.get("isError"):
+        if "rate" in text.lower() or "limit" in text.lower():
+            raise _MCPRefused(text[:200])
+        raise ToolError(text[:200])
+    return text
+
+
+def _parse_exa(text):
+    """Exa: blocks of 'Title: / URL: / Published: / Highlights:' separated by ---."""
+    results = []
+    for block in re.split(r"\n-{3,}\n", text):
+        title = re.search(r"^Title:\s*(.+)$", block, re.M)
+        url = re.search(r"^URL:\s*(\S+)", block, re.M)
+        if not url:
+            continue
+        body = block.split("Highlights:", 1)[1] if "Highlights:" in block else ""
+        results.append({"title": title.group(1).strip() if title else url.group(1),
+                        "url": url.group(1), "snippet": " ".join(body.split())})
+    return results
+
+
+def _parse_parallel(text):
+    data = json.loads(text)
+    return [{"title": r.get("title") or r.get("url", ""), "url": r.get("url", ""),
+             "snippet": " ".join(" ".join(r.get("excerpts") or []).split())}
+            for r in data.get("results") or [] if r.get("url")]
+
+
+def _parse_you(text):
+    data = json.loads(text)
+    web = ((data.get("results") or {}).get("web")) or []
+    out = []
+    for r in web:
+        if not r.get("url"):
+            continue
+        highlights = ((r.get("contents") or {}).get("highlights")) or []
+        snippet = " ".join(" ".join([r.get("description") or ""] + highlights[:2]).split())
+        out.append({"title": r.get("title", ""), "url": r["url"], "snippet": snippet})
+    return out
+
+
+def _parse_tavily(text):
+    data = json.loads(text)
+    return [{"title": r.get("title") or r.get("url", ""), "url": r.get("url", ""),
+             "snippet": " ".join((r.get("content") or "").split())}
+            for r in data.get("results") or [] if r.get("url")]
+
+
+MCP_SEARCH_CALLS = {
+    "exa": ("web_search_exa", lambda q: {"query": q, "objective": q, "numResults": WEB_SEARCH_RESULTS * 2}, _parse_exa),
+    "parallel": ("web_search", lambda q: {"objective": q, "search_queries": [q]}, _parse_parallel),
+    "tavily": ("tavily_search", lambda q: {"query": q, "max_results": WEB_SEARCH_RESULTS * 2}, _parse_tavily),
+    "you.com": ("you-search", lambda q: {"query": q, "count": WEB_SEARCH_RESULTS * 2}, _parse_you),
+}
+
+
+async def mcp_search_results(name, query):
+    """Results from one keyless MCP search server, or None if it failed or is cooling down."""
+    if time.time() < _mcp_blocked_until.get(name, 0):
+        return None
+    tool, make_args, parse = MCP_SEARCH_CALLS[name]
+    try:
+        text = await _mcp_tool(name, tool, make_args(query))
+        try:
+            results = parse(text)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            results = None
+        # some servers answer "you hit your limit" as a normal result (even as valid json),
+        # which parses as zero results, so an empty answer gets its text checked
+        if not results and any(w in text.lower() for w in ("limit", "quota", "cap_reached", "exceeded")):
+            raise _MCPRefused(text[:120])
+        if results is None:
+            raise ToolError(f"unreadable answer: {text[:80]!r}")
+        return results or None
+    except _MCPRefused as e:
+        # a monthly or daily cap won't come back in half an hour, so wait a day for those
+        long = any(w in str(e).lower() for w in ("monthly", "daily", "month", "day"))
+        wait = 24 * 60 * 60 if long else MCP_COOLDOWN
+        _mcp_blocked_until[name] = time.time() + wait
+        _mcp_sessions.pop(name, None)
+        print(f"[search] {name} refused ({e}), skipping it for {wait // 60} min")
+    except Exception as e:
+        _mcp_sessions.pop(name, None)
+        print(f"[search] {name} {type(e).__name__}: {e}")
+    return None
+
+
+AGENTSEARCH_URL = "https://relay.agentsearchhq.com/v1/search"
+AGENTSEARCH_COOLDOWN = 6 * 60 * 60   # its free tier is 25 a day per ip, so a refusal means "later today"
+_agentsearch_blocked_until = 0.0
+
+
+async def agentsearch_results(query):
+    """AgentSearch's relay: documented as free for web search with no key, 25 a day per ip."""
+    global _agentsearch_blocked_until
+    if time.time() < _agentsearch_blocked_until:
+        return None
+    headers = {**SEARCH_HEADERS, "Content-Type": "application/json", "Accept": "application/json"}
+    async with http_session(headers=headers) as session:
+        async with session.post(AGENTSEARCH_URL, json={"query": query}) as resp:
+            status = resp.status
+            data = await resp.json(content_type=None) if status == 200 else None
+    if status in (401, 402, 403, 429):
+        _agentsearch_blocked_until = time.time() + AGENTSEARCH_COOLDOWN
+        print(f"[search] agentsearch -> {status} (daily free searches used up?), skipping it for 6h")
+        return None
+    if status != 200 or not data:
+        print(f"[search] agentsearch -> {status}")
+        return None
+    return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": " ".join((r.get("content") or "").split())}
+            for r in data.get("results") or [] if r.get("url")]
+
+
+async def wikipedia_results(query):
+    """English Wikipedia's own search api. Only knows encyclopedia topics, but it's official,
+    free and basically never blocks anyone, so it's a dependable last resort for facts."""
+    async with http_session() as session:
+        data = await get_json(session, "https://en.wikipedia.org/w/api.php", params={
+            "action": "query", "list": "search", "srsearch": query, "srlimit": WEB_SEARCH_RESULTS,
+            "format": "json", "formatversion": "2"})
+    return [{"title": h["title"], "url": "https://en.wikipedia.org/wiki/" + urllib.parse.quote(h["title"].replace(" ", "_")),
+             "snippet": html_to_text(h.get("snippet") or "")}
+            for h in (data.get("query") or {}).get("search") or []]
+
+
+async def wiby_results(query):
+    """Wiby: a search engine for the old-school 'small web' with an official json api.
+    Hand-curated index, so it only helps for niche or hobby topics."""
+    async with http_session(headers={**SEARCH_HEADERS, "Accept": "application/json"}) as session:
+        rows = await get_json(session, "https://wiby.me/json/", params={"q": query})
+    return [{"title": r.get("Title") or r.get("URL", ""), "url": r.get("URL", ""), "snippet": " ".join((r.get("Snippet") or "").split())}
+            for r in rows or [] if isinstance(r, dict) and r.get("URL")]
+
+
+MWMBL_SEARCH = "https://api.mwmbl.org/api/v1/search/"
+
+
+async def mwmbl_results(query):
+    """Mwmbl: a non-profit, open source search engine with its own (small) index and an open
+    api. Weak on news, fine for evergreen stuff, and nothing to do with the big engines."""
+    async with http_session(headers={**SEARCH_HEADERS, "Accept": "application/json"}) as session:
+        rows = await get_json(session, MWMBL_SEARCH, params={"s": query})
+    join = lambda parts: "".join(p.get("value", "") for p in parts or []) if isinstance(parts, list) else str(parts or "")
+    return [{"title": join(r.get("title")) or r.get("url", ""), "url": r.get("url", ""), "snippet": join(r.get("extract"))}
+            for r in rows or [] if isinstance(r, dict) and r.get("url")]
+
+
 DDGS_BACKENDS = ("yahoo", "auto")   # yahoo first: "auto" picks its own engines and can skip
                                     # yahoo, which was the only one working on a flagged ip
 
@@ -353,8 +622,9 @@ async def search_results(query, region="us-en"):
     results is None only when every backend failed; [] means it worked and found nothing.
 
     order: cache, your SearXNG (if SEARXNG_URL is set), ddg html then lite (skipped while
-    cooling down from a 202), the ddgs package (other engines), then ddg instant answers
-    for plain queries.
+    cooling down from a 202), firecrawl's keyless search, the keyless MCP search servers
+    (exa, parallel, tavily, you.com), agentsearch, the ddgs package (other engines), then
+    for plain queries mwmbl, wikipedia, wiby and ddg instant answers.
     """
     global _ddg_blocked_until
     key = (query.lower(), region)
@@ -383,10 +653,38 @@ async def search_results(query, region="us-en"):
                 print(f"[search] ddg is rate limiting us, skipping it for {DDG_COOLDOWN}s")
 
     if not results:
-        # ddg blocked us, is cooling down, or came back empty: let ddgs try other engines
+        # ddg blocked us or is cooling down: firecrawl's keyless search, which doesn't care
+        # whether our ip is flagged by the engines
+        more = await attempt("firecrawl", firecrawl_results(query))
+        if more:
+            results, source = more, "firecrawl"
+
+    for name in MCP_SERVERS:
+        if results:
+            break
+        # keyless ai search apis (exa, parallel, you.com last since it's capped at 100/day)
+        more = await mcp_search_results(name, query)
+        if more:
+            results, source = more, name
+
+    if not results:
+        more = await attempt("agentsearch", agentsearch_results(query))
+        if more:
+            results, source = more, "agentsearch"
+
+    if not results:
+        # still nothing: let ddgs try other engines
         more = await ddgs_results(query, region)
         if more:
             results, source = more, "ddgs"
+
+    # small independent indexes, then wikipedia: weaker for news, but nobody blocks them
+    for name, finder in (("mwmbl", mwmbl_results), ("wikipedia", wikipedia_results), ("wiby", wiby_results)):
+        if results or query.lower().startswith("site:"):
+            break
+        more = await attempt(name, finder(query))
+        if more:
+            results, source = more, name
 
     # instant answers know nothing about site: filters, so those can't use it
     if results is None and not query.lower().startswith("site:"):
@@ -1170,7 +1468,9 @@ with you your we our not no do does did can could would should about into than t
 
 
 def _tokens(text):
-    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS and len(w) > 1]
+    # single letters are noise, but single digits matter ("6 7", "iphone 4", "python 3")
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower())
+            if w not in STOPWORDS and (len(w) > 1 or w.isdigit())]
 
 
 def _read_doc(path):

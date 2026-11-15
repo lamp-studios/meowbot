@@ -1069,7 +1069,18 @@ listen_sessions = {}   # guild id -> {"sink": ListenSink, "channel": text channe
 voice_replies = {}     # (guild id, user id) -> the task answering what they last said
 
 
-def start_listening(vc, channel):
+VOICE_STATUS_EVERY = 10      # seconds between "[voice] last 10s: ..." console lines
+VOICE_MAX_RESTARTS = 5       # receive crashes we recover from per guild before giving up
+
+
+def _report_task_error(task):
+    """Background tasks swallow their exceptions unless someone looks, so look."""
+    if not task.cancelled() and task.exception():
+        e = task.exception()
+        print(f"[voice] reply task crashed: {type(e).__name__}: {e}")
+
+
+def start_listening(vc, channel, restarts=0):
     """Start hearing the VC. Replies get posted in `channel` and read out loud."""
     guild_id = vc.guild.id
     stop_listening(guild_id)
@@ -1085,14 +1096,61 @@ def start_listening(vc, channel):
         old = voice_replies.get(key)
         if old and not old.done():
             old.cancel()   # they said something new before we answered the last thing
-        voice_replies[key] = asyncio.create_task(voice_turn(guild_id, member, pcm))
+        task = asyncio.create_task(voice_turn(guild_id, member, pcm))
+        task.add_done_callback(_report_task_error)
+        voice_replies[key] = task
 
     sink = voice_listen.ListenSink(vc, bot.loop, on_speech_start, on_utterance)
     sink.ignored.add(bot.user.id)
-    vc.start_recording(sink)
-    listen_sessions[guild_id] = {"sink": sink, "channel": channel}
+    session = {"sink": sink, "channel": channel, "restarts": restarts}
+
+    def restart_after_crash():
+        if listen_sessions.get(guild_id) is not session:
+            return   # stopped on purpose, or already replaced
+        if not vc.is_connected():
+            stop_listening(guild_id)
+            return
+        if session["restarts"] >= VOICE_MAX_RESTARTS:
+            print(f"[voice] receive keeps crashing in guild {guild_id}, giving up. /ai_tts listen:true to retry")
+            stop_listening(guild_id)
+            return
+        print(f"[voice] restarting listening ({session['restarts'] + 1}/{VOICE_MAX_RESTARTS})")
+        start_listening(vc, channel, session["restarts"] + 1)
+
+    def on_recording_done(error):
+        # py-cord calls this from its receive thread whenever recording ends, including
+        # when it crashes. the crash is the interesting part, so it gets printed in full
+        if error is None:
+            return
+        print(f"[voice] receive crashed: {type(error).__name__}: {error}")
+        bot.loop.call_soon_threadsafe(lambda: bot.loop.call_later(2, restart_after_crash))
+
+    vc.start_recording(sink, on_recording_done)
+    listen_sessions[guild_id] = session
+    session["status"] = asyncio.create_task(voice_status_loop(guild_id, session))
     voice_listen.preload()   # so the first sentence doesn't wait for the model to load
     print(f"[voice] listening in {vc.channel} (guild {guild_id})")
+
+
+async def voice_status_loop(guild_id, session):
+    """Print what the receive side is doing, so 'it can't hear me' can be narrowed down:
+    no packets = discord isn't sending audio, packets but dave_fail = decryption,
+    frames but loudest under VOICE_SPEECH_RMS = the mic is too quiet for the threshold."""
+    quiet_since_print = 0
+    while listen_sessions.get(guild_id) is session:
+        await asyncio.sleep(VOICE_STATUS_EVERY)
+        packets = voice_recv_patch.take_stats()
+        heard = session["sink"].take_stats()
+        if not packets and not heard["frames"]:
+            quiet_since_print += VOICE_STATUS_EVERY
+            if quiet_since_print >= 60:   # once a minute is enough for "nothing"
+                print(f"[voice] no audio packets reaching the bot in the last {quiet_since_print}s")
+                quiet_since_print = 0
+            continue
+        quiet_since_print = 0
+        counts = ", ".join(f"{k} {v}" for k, v in sorted(packets.items()))
+        print(f"[voice] last {VOICE_STATUS_EVERY}s: {counts or 'no packets'} | sink got {heard['frames']} frames "
+              f"from {heard['people']} people, loudest {heard['loudest']} (speech threshold {voice_listen.SPEECH_RMS:.0f})")
 
 
 def stop_listening(guild_id):
@@ -1103,6 +1161,9 @@ def stop_listening(guild_id):
             task.cancel()
     if not session:
         return
+    status = session.get("status")
+    if status and not status.done():
+        status.cancel()
     vc = session["sink"].vc
     try:
         if vc and vc.is_recording():
@@ -1117,6 +1178,14 @@ async def voice_turn(guild_id, member, pcm):
     if not session:
         return
     channel = session["channel"]
+    # py-cord hands over a bare discord.Object for people it hasn't cached, which has no
+    # display_name, so look the real member up
+    if not hasattr(member, "display_name"):
+        try:
+            member = channel.guild.get_member(member.id) or await channel.guild.fetch_member(member.id)
+        except discord.HTTPException:
+            print(f"[voice] couldn't look up member {member.id}, skipping what they said")
+            return
     try:
         heard = await asyncio.to_thread(voice_listen.transcribe, pcm)
     except Exception as e:

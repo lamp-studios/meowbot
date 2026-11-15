@@ -65,6 +65,18 @@ async def main():
             show(name, t, error=f"{type(e).__name__}: {e}")
         await asyncio.sleep(1)
 
+    t = time.time()
+    try:
+        r = await ai_tools.firecrawl_results(QUERY)
+        show("firecrawl (keyless)", t, r, None if r is not None else "refused or failed, see the log line above")
+    except Exception as e:
+        show("firecrawl (keyless)", t, error=f"{type(e).__name__}: {e}")
+
+    for name in ai_tools.MCP_SERVERS:
+        t = time.time()
+        r = await ai_tools.mcp_search_results(name, QUERY)
+        show(f"{name} (keyless mcp)", t, r, None if r is not None else "refused or failed, see the log line above")
+
     from ddgs import DDGS
     for engine in DDGS_ENGINES:
         t = time.time()
@@ -73,6 +85,21 @@ async def main():
             show(f"ddgs {engine}", t, [{"url": r.get("href", "")} for r in rows])
         except Exception as e:
             show(f"ddgs {engine}", t, error=f"{type(e).__name__}: {str(e)[:80]}")
+
+    t = time.time()
+    try:
+        r = await ai_tools.agentsearch_results(QUERY)
+        show("agentsearch (keyless)", t, r, None if r is not None else "refused or failed, see the log line above")
+    except Exception as e:
+        show("agentsearch (keyless)", t, error=f"{type(e).__name__}: {e}")
+
+    for name, finder in (("mwmbl", ai_tools.mwmbl_results), ("wikipedia", ai_tools.wikipedia_results),
+                         ("wiby", ai_tools.wiby_results)):
+        t = time.time()
+        try:
+            show(name, t, await finder(QUERY))
+        except Exception as e:
+            show(name, t, error=f"{type(e).__name__}: {e}")
 
     t = time.time()
     try:
