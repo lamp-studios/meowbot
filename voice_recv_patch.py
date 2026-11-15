@@ -158,17 +158,25 @@ def apply():
         if not getattr(sink, "direct_pcm", False):
             return original_feed_rtp(self, packet)
 
-        direct = self.__dict__.setdefault("_direct", {})   # ssrc -> [opus decoder, last seq]
+        direct = self.__dict__.setdefault("_direct", {})   # ssrc -> [opus decoder, last seq, late run]
         state = direct.get(packet.ssrc)
         if state is None:
-            state = direct[packet.ssrc] = [opus.Decoder(), -1]
-        decoder, last = state
-        if last >= 0:
-            ahead = (packet.sequence - last) & 0xFFFF
+            state = direct[packet.ssrc] = [opus.Decoder(), -1, 0]
+        if state[1] >= 0:
+            ahead = (packet.sequence - state[1]) & 0xFFFF
             if ahead == 0 or ahead > 0x8000:
-                STATS["late_or_dup"] += 1   # already played past it, can't slot it back in
-                return
+                state[2] += 1
+                if state[2] < 5:
+                    STATS["late_or_dup"] += 1   # already played past it, can't slot it back in
+                    return
+                # five "late" packets in a row isn't jitter, the sender restarted its
+                # numbering (reconnect, stream reset). follow it, or we'd drop everything
+                # they say until the old count catches up, which can take minutes
+                STATS["stream_reset"] += 1
+                state[0] = opus.Decoder()
         state[1] = packet.sequence
+        state[2] = 0
+        decoder = state[0]
 
         try:
             pcm = decoder.decode(packet.decrypted_data, fec=False)
@@ -202,6 +210,20 @@ def apply():
 
     VoiceClient.stop_recording = stop_recording
     VoiceClient.stop_listening = stop_recording
+
+    # ---- 7. stop() stops PLAYBACK, not recording ----
+    # VoiceClient.stop() is documented as "Stops playing audio", but in 2.8.1 it also stops
+    # the audio reader. so cutting the bot off mid-sentence (stop the tts) silently ended
+    # listening too, with no error for anyone to notice
+    def stop(self):
+        if self._player:
+            self._player.stop()
+        if self._player_future:
+            self.loop.call_soon_threadsafe(self._set_future_result_if_pending, self._player_future, None)
+        self._player = None
+        self._player_future = None
+
+    VoiceClient.stop = stop
 
     applied = True
     print(f"[voice] patched py-cord {PATCHED_VERSION} voice receive (DAVE decrypt order, keepalive)")
