@@ -66,6 +66,9 @@ class ListenSink(Sink):
     # what py-cord's receive machinery expects a sink to have (the released base class
     # doesn't define them, which is part of why recording crashes out of the box)
     __sink_listeners__ = []
+    # take frames straight from the receive thread instead of py-cord's lossy jitter buffer,
+    # see voice_recv_patch.py fix 6
+    direct_pcm = True
 
     def __init__(self, vc, loop, on_speech_start, on_utterance):
         super().__init__()
@@ -176,11 +179,56 @@ _model = None
 _model_lock = threading.Lock()
 
 
+def _preload_cuda_libs():
+    """Make faster-whisper's gpu path work without touching LD_LIBRARY_PATH.
+
+    It needs cuBLAS and cuDNN, which (unlike ollama) it doesn't bundle. On linux they come
+    from the nvidia-cublas-cu12 / nvidia-cudnn-cu12 pip packages, which drop the .so files
+    inside site-packages where the dynamic loader never looks. Loading them here first with
+    RTLD_GLOBAL means that when ctranslate2 later asks for libcublas.so.12 by name, it's
+    already in the process and gets used.
+    """
+    import sys
+    if not sys.platform.startswith("linux"):
+        return
+    import ctypes
+    import glob
+    import importlib.util
+
+    libs = []
+    for pkg in ("nvidia.cuda_nvrtc", "nvidia.cublas", "nvidia.cudnn"):
+        try:
+            spec = importlib.util.find_spec(pkg)
+        except ModuleNotFoundError:
+            spec = None
+        for folder in (spec.submodule_search_locations or []) if spec else []:
+            libs += sorted(glob.glob(os.path.join(folder, "lib", "lib*.so*")))
+    if not libs:
+        return
+
+    # the cudnn pieces depend on each other, so keep retrying whatever failed until a pass
+    # loads nothing new (any order works out within a few passes)
+    pending = libs
+    while pending:
+        failed = []
+        for path in pending:
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                failed.append(path)
+        if len(failed) == len(pending):
+            break
+        pending = failed
+    print(f"[voice] preloaded {len(libs) - len(pending)} cuda libraries for whisper"
+          + (f" ({len(pending)} wouldn't load)" if pending else ""))
+
+
 def _get_model():
     """Load whisper once, on first use (the model downloads the first time, ~150MB for base)."""
     global _model
     with _model_lock:
         if _model is None:
+            _preload_cuda_libs()
             from faster_whisper import WhisperModel
             device = WHISPER_DEVICE
             started = time.time()

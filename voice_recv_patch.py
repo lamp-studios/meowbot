@@ -141,6 +141,52 @@ def apply():
     # ---- 4. keepalive every 5 seconds ----
     reader.UDPKeepAlive.delay = 5
 
+    # ---- 6. skip the jitter buffer for sinks that ask for it ----
+    # py-cord's JitterBuffer loses most of the audio: whenever the next packet isn't exactly
+    # the next sequence number it flushes and keeps only ONE packet, and its lock is commented
+    # out while two threads use it. measured on a real call: ~75% of decrypted voice frames
+    # never reached the sink. a sink with `direct_pcm = True` gets every frame decoded the
+    # moment it arrives instead (in order per speaker; duplicates and late stragglers dropped)
+    from discord.object import Object
+    from discord.voice import VoiceData
+    from discord.voice.receive import router
+
+    original_feed_rtp = router.PacketRouter.feed_rtp
+
+    def feed_rtp(self, packet):
+        sink = self.sink
+        if not getattr(sink, "direct_pcm", False):
+            return original_feed_rtp(self, packet)
+
+        direct = self.__dict__.setdefault("_direct", {})   # ssrc -> [opus decoder, last seq]
+        state = direct.get(packet.ssrc)
+        if state is None:
+            state = direct[packet.ssrc] = [opus.Decoder(), -1]
+        decoder, last = state
+        if last >= 0:
+            ahead = (packet.sequence - last) & 0xFFFF
+            if ahead == 0 or ahead > 0x8000:
+                STATS["late_or_dup"] += 1   # already played past it, can't slot it back in
+                return
+        state[1] = packet.sequence
+
+        try:
+            pcm = decoder.decode(packet.decrypted_data, fec=False)
+            STATS["decoded"] += 1
+        except opus.OpusError:
+            STATS["opus_error"] += 1
+            pcm = SILENT_PCM
+
+        vc = sink.client
+        uid = vc._ssrc_to_id.get(packet.ssrc) or vc._connection.ssrc_user_map.get(packet.ssrc)
+        member = (vc.guild.get_member(uid) if vc.guild and uid else None) or (Object(id=uid) if uid else None)
+        try:
+            sink.write(VoiceData(packet, member, pcm=pcm), member)
+        except Exception as exc:   # same rule as the router: never let this thread die
+            _log.debug("sink.write failed", exc_info=exc)
+
+    router.PacketRouter.feed_rtp = feed_rtp
+
     # ---- 5. stopping twice is fine ----
     # when the receive machinery dies, BOTH of its router threads call stop_recording() on
     # the way out, and the second one raises "You are not recording" over the real error

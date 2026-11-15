@@ -22,6 +22,8 @@ import ai_tools  # noqa: E402
 
 QUERY = sys.argv[1] if len(sys.argv) > 1 else "ireland vs fiji rugby score"
 DDGS_ENGINES = ["yahoo", "brave", "mojeek", "startpage", "duckduckgo", "wikipedia", "grokipedia", "auto"]
+if ai_tools.ddg_disabled():   # don't let the check itself poke ddg while the ip recovers
+    DDGS_ENGINES = [e for e in DDGS_ENGINES if e not in ("duckduckgo", "auto")]
 
 
 def show(name, started, results=None, error=None):
@@ -48,7 +50,10 @@ async def main():
     else:
         print("  SKIP  searxng                       SEARXNG_URL isn't set in .env")
 
-    for name, endpoint, parse in [
+    ddg_off = ai_tools.ddg_disabled()
+    if ddg_off:
+        print("  SKIP  duckduckgo (all of it)         DISABLE_DDG is on in .env")
+    for name, endpoint, parse in [] if ddg_off else [
         ("duckduckgo html", "https://html.duckduckgo.com/html/", ai_tools._parse_ddg_html),
         ("duckduckgo lite", "https://lite.duckduckgo.com/lite/", ai_tools._parse_ddg_lite),
     ]:
@@ -103,6 +108,8 @@ async def main():
 
     t = time.time()
     try:
+        if ai_tools.ddg_disabled():
+            raise RuntimeError("skipped, DISABLE_DDG is on")
         show("ddg instant answers", t, await ai_tools.ddg_instant_results(QUERY))
     except Exception as e:
         show("ddg instant answers", t, error=f"{type(e).__name__}: {e}")

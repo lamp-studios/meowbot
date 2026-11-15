@@ -11,6 +11,8 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "kokoro-onnx>=0.6.1",
     "numpy>=2.5.2",
+    "nvidia-cublas-cu12>=12.9.3.13 ; sys_platform == 'linux'",
+    "nvidia-cudnn-cu12>=9,<10 ; sys_platform == 'linux'",
     "ollama>=0.6.2",
     "opencv-python>=5.0.0.93",
     "pip-chill>=1.0.5",

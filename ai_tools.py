@@ -250,6 +250,12 @@ async def ddg_results(query, region="us-en"):
     return None, last_status
 
 
+def ddg_disabled():
+    """DISABLE_DDG=1 in .env: never contact duckduckgo, so a flagged ip can recover. Read per
+    call because main.py imports this module before it loads .env."""
+    return (os.getenv("DISABLE_DDG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def searxng_url():
     # read per call: main.py imports this module before it loads .env
     return (os.getenv("SEARXNG_URL") or "").rstrip("/")
@@ -568,7 +574,9 @@ DDGS_BACKENDS = ("yahoo", "auto")   # yahoo first: "auto" picks its own engines 
 def _ddgs_text(query, region):
     from ddgs import DDGS   # imported here so a broken ddgs install can't stop the bot starting
     last_error = None
-    for backend in DDGS_BACKENDS:
+    # "auto" can pick ddgs's own duckduckgo engine, so it's left out while ddg is switched off
+    backends = ("yahoo",) if ddg_disabled() else DDGS_BACKENDS
+    for backend in backends:
         try:
             rows = DDGS(timeout=HTTP_TIMEOUT).text(query, region=region, safesearch="moderate",
                                                    backend=backend, max_results=WEB_SEARCH_RESULTS * 2)
@@ -643,7 +651,7 @@ async def search_results(query, region="us-en"):
     if searxng_url():
         results, source = await attempt("searxng", searxng_results(query, region)), "searxng"
 
-    if results is None and time.time() >= _ddg_blocked_until:
+    if results is None and not ddg_disabled() and time.time() >= _ddg_blocked_until:
         found = await attempt("ddg", ddg_results(query, region))
         if found:
             results, status = found
@@ -687,7 +695,7 @@ async def search_results(query, region="us-en"):
             results, source = more, name
 
     # instant answers know nothing about site: filters, so those can't use it
-    if results is None and not query.lower().startswith("site:"):
+    if results is None and not ddg_disabled() and not query.lower().startswith("site:"):
         # empty here means "the real search is down and this one knew nothing", which is
         # not the same as the web having no results, so it counts as a failure
         results, source = (await attempt("ddg instant", ddg_instant_results(query))) or None, "ddg instant answers"
