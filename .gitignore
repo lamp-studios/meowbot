@@ -26,3 +26,5 @@ voices-v1.0.bin
 memory.db
 memory.db-wal
 memory.db-shm
+server_config.db
+server_config.db-journal

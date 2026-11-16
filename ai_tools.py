@@ -1602,7 +1602,7 @@ class DocumentIndex:
 DOCS = DocumentIndex(DOCS_DIR)
 
 
-async def search_documents(query: str):
+async def search_documents(query: str = ""):
     """Searches the bot's own document library: research papers and other files the owner
     put in it. Returns the most relevant passages, each labelled with its file and page.
 
